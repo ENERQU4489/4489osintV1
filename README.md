@@ -343,7 +343,7 @@ If you use Netryx Astra V2 in your research or work, we'd appreciate a citation:
   title={Netryx Astra V2: State-of-the-Art AI Geolocation},
   author={Sairaj Balaji},
   year={2026},
-  url={https://github.com/yourusername/netryx-astra-v2}
+  url={https://github.com/sparkyniner/Netryx-Astra-V2-Geolocation-Tool}
 }
 ```
 
