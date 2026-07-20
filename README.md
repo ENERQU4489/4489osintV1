@@ -215,8 +215,8 @@ python3 test_super.py
 
 **Windows:**
 ```
-git clone https://github.com/sparkyniner/netryx-astra-v2.git
-cd netryx-astra-v2
+git clone https://github.com/sparkyniner/Netryx-Astra-V2-Geolocation-Tool.git
+cd Netryx-Astra-V2-Geolocation-Tool
 ```
 Then double-click **`setup.bat`** to install everything. When it finishes, double-click **`run.bat`** to launch.
 
