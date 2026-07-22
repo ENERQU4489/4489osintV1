@@ -194,7 +194,7 @@ def extract_megaloc_descriptor(pil_img, apply_pca_reduction=True):
         with autocast(_device, dtype=torch.bfloat16):
             desc = model(tensor)  # [1, 8448]
 
-    desc = desc.cpu().numpy().squeeze()  # (8448,)
+    desc = desc.float().cpu().numpy().squeeze()  # (8448,)
 
     if apply_pca_reduction and _pca_model is not None:
         desc = apply_pca(desc.reshape(1, -1)).squeeze()
@@ -223,7 +223,7 @@ def batch_extract_megaloc(pil_images, batch_size=16, apply_pca_reduction=False):
             with autocast(_device, dtype=torch.bfloat16):
                 descs = model(tensors)  # [B, 8448]
 
-        all_descs.append(descs.cpu().numpy())
+        all_descs.append(descs.float().cpu().numpy())
 
         # Memory cleanup for MPS
         if _device == 'mps' and (i // batch_size) % 10 == 0:
