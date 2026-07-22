@@ -46,7 +46,7 @@ MAX_HEADING_WORKERS = 4
 MAX_DOWNLOAD_WORKERS = 120
 MAX_MATCH_WORKERS = 16
 EARLY_EXIT_INLIER_THRESHOLD = 300
-MEGALOC_BATCH_SIZE = 16
+MEGALOC_BATCH_SIZE = 64  # descriptors are identical at any batch size; larger = better GPU utilization
 CROP_QUEUE_SIZE =  1024
 
 
@@ -619,19 +619,31 @@ def build_compact_index():
     print(f"[INDEX] Keeping {len(valid_idx)} entries with valid coordinates")
 
     # ── Filter and normalize ──
+    # NOTE: fancy-index copy (all_descs[valid_idx].copy()) briefly doubles
+    # peak RAM (~2x index size) and gets OOM-killed on multi-GB indexes.
     print("[INDEX] Filtering valid descriptors...")
-    descs_valid = all_descs[valid_idx].copy()
-    del all_descs
+    n_valid = len(valid_idx)
+    if n_valid == idx:
+        descs_valid = all_descs  # nothing filtered — no copy needed
+    else:
+        # valid_idx is sorted ascending, so row j's source index is >= j and
+        # forward compaction never overwrites a row before it is read
+        for j, src in enumerate(valid_idx):
+            if j != src:
+                all_descs[j] = all_descs[src]
+        descs_valid = all_descs[:n_valid]
 
-    print("[INDEX] Normalizing in-place...")
-    norms = np.linalg.norm(descs_valid, axis=1, keepdims=True)
-    norms[norms == 0] = 1
-    descs_valid /= norms
-    del norms
+    print("[INDEX] Normalizing in-place (chunked)...")
+    NORM_CHUNK = 200_000
+    for s in range(0, n_valid, NORM_CHUNK):
+        chunk = descs_valid[s:s + NORM_CHUNK]
+        norms = np.sqrt(np.einsum('ij,ij->i', chunk, chunk))[:, None]
+        norms[norms == 0] = 1
+        chunk /= norms
 
     print("[INDEX] Saving descriptors...")
     np.save(COMPACT_DESCS_PATH, descs_valid)
-    del descs_valid
+    del descs_valid, all_descs
 
     print("[INDEX] Saving metadata...")
     np.savez_compressed(COMPACT_META_PATH,
@@ -1267,7 +1279,9 @@ class StreetViewMatcherGUI:
                     timestamp = int(time.time() * 1000)
                     part_filename = os.path.join(MEGALOC_PARTS_DIR, f"megaloc_part_{timestamp}.npz")
                     all_descs = np.vstack(megaloc_buffer_descs)
-                    np.savez_compressed(
+                    # uncompressed savez: float32 descriptors barely compress, and
+                    # np.load reads both formats identically
+                    np.savez(
                         part_filename,
                         descriptors=all_descs,
                         paths=np.array(megaloc_buffer_paths, dtype=object),
@@ -1325,7 +1339,15 @@ class StreetViewMatcherGUI:
         base_dirs = get_projection_base_dirs(crop_fov, (crop_size, crop_size))
 
         def process_one_panoid(panoid):
-            tiles = tiles_info(panoid['panoid'])
+            panoid_id = panoid['panoid']
+
+            # Use a dummy shard path — actual storage is in eigenplace parts, not individual .npz
+            missing_yaws = [y for y in headings_all if f"{panoid_id}_{y}.npz" not in existing_files]
+            if not missing_yaws:
+                # Fully indexed already — skip the download entirely
+                return True
+
+            tiles = tiles_info(panoid_id)
             tiles_data = download_tiles(tiles, max_workers=MAX_DOWNLOAD_WORKERS)
             if not tiles_data:
                 return False
@@ -1338,10 +1360,6 @@ class StreetViewMatcherGUI:
                 pano_img = pano_img.resize((maxw, int(pano_img.size[1] * (maxw / pano_img.size[0]))), Image.BILINEAR)
 
             pano_t = pil_to_tensor(pano_img)
-            panoid_id = panoid['panoid']
-
-            # Use a dummy shard path — actual storage is in eigenplace parts, not individual .npz
-            missing_yaws = [y for y in headings_all if f"{panoid_id}_{y}.npz" not in existing_files]
 
             if missing_yaws:
                 crops_batch = equirectangular_to_rectilinear_torch(
@@ -1366,26 +1384,11 @@ class StreetViewMatcherGUI:
         crop_queue.put("DONE")
         extractor_thread.join()
 
-        q.put(('status', f"All embeddings saved ({total_extracted} new). Fitting PCA..."))
-
-        try:
-            part_files = sorted(glob.glob(os.path.join(MEGALOC_PARTS_DIR, "megaloc_part_*.npz")))
-            all_raw = []
-            for pf in part_files:
-                data = np.load(pf, allow_pickle=True)
-                all_raw.append(data['descriptors'])
-            if all_raw:
-                all_raw = np.vstack(all_raw)
-                from megaloc_utils import fit_pca, save_pca, apply_pca, MEGALOC_PCA_DIM
-                pca = fit_pca(all_raw, n_components=MEGALOC_PCA_DIM, whiten=True)
-                pca_path = os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
-                save_pca(pca_path)
-                
-                # Do NOT resave parts. They must stay 8448 dimensions on disk!
-            q.put(('status', f"PCA fitted. Building index..."))
-        except Exception as e:
-            print(f"PCA Error: {e}")
-            q.put(('status', f"All embeddings saved ({total_extracted} new). Building index..."))
+        # PCA is fitted inside build_compact_index() on a 100k subsample —
+        # fitting here on ALL raw descriptors loads every part file into RAM
+        # at once and OOMs on large indexes, and its result was overwritten
+        # by build_compact_index()'s own fit anyway.
+        q.put(('status', f"All embeddings saved ({total_extracted} new). Building index (fits PCA)..."))
 
         build_compact_index()
         q.put(('status', f"Done! Index ready. {total_extracted} new entries added."))
