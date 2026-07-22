@@ -949,9 +949,9 @@ class StreetViewMatcherGUI:
         master.geometry("1400x1050")
 
         # vars for the gui
-        self.lat_var = tk.DoubleVar(value=55.7569)   # moscowdefault
-        self.lon_var = tk.DoubleVar(value=37.6151)
-        self.radius_var = tk.DoubleVar(value=10.0)
+        self.lat_var = tk.DoubleVar(value=40.7132)   # NYC index center
+        self.lon_var = tk.DoubleVar(value=-74.0025)
+        self.radius_var = tk.DoubleVar(value=13.0)
         self.res_var = tk.IntVar(value=300)
         self.match_threshold = tk.IntVar(value=50)
         self.crop_fov = tk.IntVar(value=90)
@@ -1032,6 +1032,8 @@ class StreetViewMatcherGUI:
         ttk.Label(left_ctrl, text="Mode", style='Section.TLabel').grid(row=1, column=0, sticky='w', pady=(5, 8))
         m_btns_frm = tk.Frame(left_ctrl, bg='#0a0a0f')
         m_btns_frm.grid(row=1, column=1, sticky='w')
+        self._tour_left_ctrl = left_ctrl
+        self.mode_frame = m_btns_frm
         RoundedRadio(m_btns_frm, text="Search", variable=self.mode_var, value="search", command=self._update_mode).grid(row=0, column=0, padx=5)
         RoundedRadio(m_btns_frm, text="Create", variable=self.mode_var, value="create", command=self._update_mode).grid(row=0, column=1, padx=5)
 
@@ -1049,9 +1051,12 @@ class StreetViewMatcherGUI:
             ("Search Radius (km)", self.radius_var),
             ("Grid Resolution", self.res_var),
         ]
+        self._coord_labels = []
         for i, (txt, var) in enumerate(params, 4):
-            ttk.Label(left_ctrl, text=txt, foreground='#9ca3af', font=('Avenir Next', 9)).grid(row=i, column=0, sticky='w', pady=12)
+            lbl = ttk.Label(left_ctrl, text=txt, foreground='#9ca3af', font=('Avenir Next', 9))
+            lbl.grid(row=i, column=0, sticky='w', pady=12)
             RoundedEntry(left_ctrl, textvariable=var, width=220, height=32).grid(row=i, column=1, sticky='w', padx=10, pady=12)
+            self._coord_labels.append(lbl)
 
 
         # Image preview
@@ -1065,6 +1070,10 @@ class StreetViewMatcherGUI:
         self.query_btn = RoundedButton(btn_frame, text="▶  Run Search", command=self.run, width=380, height=48)
         self.query_btn.pack(pady=(0, 10))
 
+        self.cancel_btn = RoundedButton(btn_frame, text="■  Cancel Search", command=self.cancel_current_search,
+            width=380, height=40, bg_color='#7f1d1d', hover_color='#991b1b', pressed_color='#5f1515')
+        # hidden until a search is running (shown by start_full_search)
+
         self.coverage_btn = RoundedButton(btn_frame, text="Show Coverage Map", command=self.show_coverage_map,
             width=380, height=44, bg_color='#1a1a2e', hover_color='#252538', pressed_color='#12121a')
         self.coverage_btn.pack(pady=(0, 8))
@@ -1077,6 +1086,11 @@ class StreetViewMatcherGUI:
             command=self.show_community_hub,
             width=380, height=44, bg_color='#1a1a2e', hover_color='#252538', pressed_color='#12121a')
         self.hub_btn.pack(pady=(0, 8))
+
+        self.help_btn = RoundedButton(btn_frame, text="❓  How to use this tool",
+            command=lambda: self.show_tutorial(force=True),
+            width=380, height=40, bg_color='#1a1a2e', hover_color='#252538', pressed_color='#12121a')
+        self.help_btn.pack(pady=(0, 8))
 
         # HF Token Field
         tk.Label(btn_frame, text="Hugging Face Token (for uploads)", bg='#0a0a0f', foreground='#6b7280', font=('Avenir Next', 8)).pack(pady=(5, 0))
@@ -1195,10 +1209,222 @@ class StreetViewMatcherGUI:
         self.coverage_markers, self.result_elements, self.search_nets = [], [], []
 
         self.match_queue, self.results_queue = queue.Queue(), queue.Queue()
+        self.cancel_search = threading.Event()
         self.thumbnail_pool = []
         self._thumbnail_pool_lock = threading.Lock()
         self._update_mode()
         self.poll_match_queue()
+
+        # First-run onboarding tour (non-blocking; only if never seen)
+        self.master.after(600, lambda: self.show_tutorial(force=False))
+
+    def show_tutorial(self, force=False):
+        """First-run guided tour. Skipped if already seen unless force=True.
+
+        Each step can highlight the real feature it describes (target widget).
+        """
+        flag = os.path.join(os.path.expanduser("~"), ".netryx_tutorial_seen")
+        if not force and os.path.exists(flag):
+            return
+
+        # (title, body, target-widget-getter) — target may be None
+        steps = [
+            ("Welcome to Netryx Astra",
+             "This tool finds WHERE a street-level photo was taken by matching it "
+             "against a database of Street View panoramas.\n\n"
+             "It works in two stages: MegaLoc shortlists likely spots, then MASt3R "
+             "confirms the exact one by matching fine visual detail.\n\n"
+             "This quick tour points out each feature — the one being described lights up "
+             "on the left as you go.",
+             None),
+            ("First: get an index to search",
+             "Netryx can only locate a photo inside an area that has been indexed. "
+             "The fastest way to start is to download a ready-made index.\n\n"
+             "Click “Community Hub” → Download, and pick one of these to begin:\n"
+             "   • new-york-city (13 km) — big, dense coverage\n"
+             "   • moscow (1 km) — small and quick to download\n\n"
+             "“km” = the radius in kilometres around the city centre that the index "
+             "covers. 13 km ≈ most of a large city; 1 km ≈ a single neighbourhood.",
+             lambda: getattr(self, 'hub_btn', None)),
+            ("Pick a mode",
+             "“Search” vs “Create”.\n\n"
+             "• Search — you have a photo and want to locate it (the usual choice).\n"
+             "• Create — build your OWN index for an area by downloading its Street "
+             "View. Only needed for places nobody has shared on the Hub yet.",
+             lambda: getattr(self, 'mode_frame', None)),
+            ("Load your photo",
+             "Click the image box (“No image selected”) and choose a street-level "
+             "photo — a building facade, a street corner, storefronts.\n\n"
+             "Best results: daytime, eye-level, lots of solid detail (brick, windows, "
+             "railings). Avoid sky, crowds, heavy foliage, and night shots.",
+             lambda: getattr(self, 'query_img_label', None)),
+            ("Set the area to search",
+             "Enter a centre Latitude / Longitude and a Search Radius (km) — the search "
+             "only looks inside that circle, so it must overlap your downloaded index.\n\n"
+             "These are pre-filled with New York City (40.7132, -74.0025, 13 km). If you "
+             "downloaded the NYC index, you can search right away.",
+             lambda: (self._coord_labels[0] if getattr(self, '_coord_labels', None) else None)),
+            ("Run — and cancel if needed",
+             "Hit “Run Search”. You’ll see “MASt3R Match: N/500” as it checks candidates; "
+             "the map drops a pin with a side-by-side match image when it finds the spot.\n\n"
+             "A red “Cancel Search” button appears while it runs — stop anytime and try a "
+             "different photo.",
+             lambda: getattr(self, 'query_btn', None)),
+            ("See what’s covered",
+             "“Show Coverage Map” plots every indexed location on the map.\n\n"
+             "If a search finds nothing, check here first: if your photo’s real location "
+             "isn’t inside the covered area, no match is expected — that’s missing "
+             "coverage, not an error.",
+             lambda: getattr(self, 'coverage_btn', None)),
+            ("Community Hub — share & get more",
+             "Beyond downloading, the Hub lets you UPLOAD an index you built so others can "
+             "use it.\n\n"
+             "Uploads need a free Hugging Face token — paste it in the token field below "
+             "the Hub button. Keep your token private.",
+             lambda: getattr(self, 'hub_btn', None)),
+            ("You’re ready",
+             "The whole flow: download an index (Hub) → load a photo → set the area → "
+             "Run Search.\n\n"
+             "Advanced options (field-of-view, crop size, match threshold) are fine at "
+             "their defaults. Reopen this tour anytime with “❓ How to use this tool”.",
+             lambda: getattr(self, 'help_btn', None)),
+        ]
+
+        win = tk.Toplevel(self.master)
+        win.title("Getting Started")
+        win.configure(bg='#0a0a0f')
+        win.geometry("560x430")
+        win.transient(self.master)
+        try:
+            win.attributes('-topmost', True)
+        except Exception:
+            pass
+        # Position over the map (right side) so the left controls stay visible to highlight
+        try:
+            self.master.update_idletasks()
+            x = self.master.winfo_rootx() + self.master.winfo_width() - 580
+            y = self.master.winfo_rooty() + 90
+            win.geometry(f"+{max(x, self.master.winfo_rootx()+40)}+{max(y,0)}")
+        except Exception:
+            pass
+
+        # Highlight ring = 4 thin purple strips forming a hollow rectangle. Strips
+        # never cover the widget's interior, so it works even for transparent
+        # ttk widgets (a filled frame would show through them as a solid block).
+        panel = self._tour_left_ctrl
+        T = 3  # border thickness
+        strips = [tk.Frame(panel, bg='#a78bfa', highlightthickness=0) for _ in range(4)]
+
+        def highlight(target):
+            for s in strips:
+                s.place_forget()
+            if target is None:
+                return
+            try:
+                target.update_idletasks()
+                panel.update_idletasks()
+                # Position relative to the panel regardless of how deeply the
+                # target is nested (buttons live inside sub-frames).
+                x = target.winfo_rootx() - panel.winfo_rootx() - T
+                y = target.winfo_rooty() - panel.winfo_rooty() - T
+                w = target.winfo_width() + 2 * T
+                h = target.winfo_height() + 2 * T
+                if w < 8 or h < 8:
+                    return
+                # Clamp to the panel so borders near an edge aren't clipped off-screen
+                pw, ph = panel.winfo_width(), panel.winfo_height()
+                if x < 0:
+                    w += x; x = 0
+                if y < 0:
+                    h += y; y = 0
+                if pw > 1 and x + w > pw:
+                    w = pw - x
+                if ph > 1 and y + h > ph:
+                    h = ph - y
+                if w < 8 or h < 8:
+                    return
+                strips[0].place(x=x, y=y, width=w, height=T)          # top
+                strips[1].place(x=x, y=y + h - T, width=w, height=T)  # bottom
+                strips[2].place(x=x, y=y, width=T, height=h)          # left
+                strips[3].place(x=x + w - T, y=y, width=T, height=h)  # right
+                for s in strips:
+                    s.lift()
+            except Exception:
+                pass
+
+        state = {"i": 0}
+
+        title_lbl = tk.Label(win, text="", bg='#0a0a0f', fg='#a78bfa',
+                             font=('SF Pro Display', 17, 'bold'), wraplength=500, justify='left')
+        title_lbl.pack(padx=30, pady=(26, 8), anchor='w')
+
+        body_lbl = tk.Label(win, text="", bg='#0a0a0f', fg='#d1d5db',
+                           font=('Avenir Next', 11), wraplength=500, justify='left')
+        body_lbl.pack(padx=30, pady=(0, 10), anchor='w')
+
+        dots_lbl = tk.Label(win, text="", bg='#0a0a0f', fg='#6b7280', font=('Avenir Next', 14))
+        dots_lbl.pack(side='bottom', pady=(0, 14))
+
+        nav = tk.Frame(win, bg='#0a0a0f')
+        nav.pack(side='bottom', fill='x', padx=26, pady=(0, 6))
+
+        def finish():
+            try:
+                with open(flag, 'w') as f:
+                    f.write("seen")
+            except Exception:
+                pass
+            for s in strips:
+                try:
+                    s.destroy()
+                except Exception:
+                    pass
+            win.destroy()
+
+        def render():
+            i = state["i"]
+            t, b, target = steps[i]
+            title_lbl.config(text=t)
+            body_lbl.config(text=b)
+            dots_lbl.config(text="  ".join("●" if j == i else "○" for j in range(len(steps))))
+            back_btn.configure(text="←  Back")
+            next_btn.configure(text=("Finish  ✓" if i == len(steps) - 1 else "Next  →"))
+            highlight(target() if callable(target) else None)
+
+        def go_next():
+            if state["i"] == len(steps) - 1:
+                finish()
+            else:
+                state["i"] += 1
+                render()
+
+        def go_back():
+            if state["i"] > 0:
+                state["i"] -= 1
+                render()
+
+        # Canvas-based buttons render custom colors reliably on macOS (native
+        # tk.Button ignores bg/fg there, which made white text vanish).
+        skip_btn = RoundedButton(nav, text="Skip tour", command=finish,
+                                 width=90, height=34, bg_color='#0a0a0f', hover_color='#151520',
+                                 pressed_color='#0a0a0f', text_color='#8b8f98',
+                                 font=('Avenir Next', 10))
+        skip_btn.pack(side='left')
+
+        next_btn = RoundedButton(nav, text="Next  →", command=go_next,
+                                 width=130, height=36, bg_color='#7c3aed', hover_color='#8b5cf6',
+                                 pressed_color='#6d28d9', text_color='#ffffff',
+                                 font=('Avenir Next', 11, 'bold'))
+        next_btn.pack(side='right')
+
+        back_btn = RoundedButton(nav, text="←  Back", command=go_back,
+                                 width=100, height=36, bg_color='#1a1a2e', hover_color='#252538',
+                                 pressed_color='#12121a', text_color='#d1d5db',
+                                 font=('Avenir Next', 11, 'bold'))
+        back_btn.pack(side='right', padx=(0, 8))
+
+        win.protocol("WM_DELETE_WINDOW", finish)
+        render()
 
     def _update_mode(self):
         mode = self.mode_var.get()
@@ -1452,6 +1678,9 @@ class StreetViewMatcherGUI:
             return
 
         self.query_btn.config(state='disabled', text="Searching...")
+        self.cancel_search.clear()
+        self.cancel_btn.config(text="■  Cancel Search", state='normal', command=self.cancel_current_search)
+        self.cancel_btn.pack(pady=(0, 10))  # reveal cancel while searching
         self.stop_animation = False
         self.thumbnail_pool = []
 
@@ -1486,7 +1715,9 @@ class StreetViewMatcherGUI:
                 except queue.Empty:
                     break
 
-            if all_bests:
+            if self.cancel_search.is_set():
+                self.master.after(0, lambda: self._set_status("Search cancelled."))
+            elif all_bests:
                 global_best = max(all_bests, key=lambda b: b['inliers'])
                 query_img_resized = Image.open(self.query_img_path).convert('RGB').resize((size, size), Image.BILINEAR)
                 self.master.after(0, lambda: self._handle_match_done(
@@ -1496,8 +1727,17 @@ class StreetViewMatcherGUI:
             else:
                 self.master.after(0, lambda: self._set_status("No good matches found."))
 
+            self.stop_animation = True
+            self.master.after(0, lambda: self.cancel_btn.pack_forget())
             self.master.after(0, lambda: self.query_btn.config(state='normal', text="▶  Run Search", command=self.run))
         threading.Thread(target=run_search_background, daemon=True).start()
+
+    def cancel_current_search(self):
+        """Signal the running search to stop; the Stage-2 loop checks this flag."""
+        self.cancel_search.set()
+        self.stop_animation = True
+        self._set_status("Cancelling search...")
+        self.cancel_btn.config(text="Cancelling...", state='disabled')
 
     # the main search pipeline thingy
 
@@ -1583,6 +1823,9 @@ class StreetViewMatcherGUI:
                     mast3r = get_lazy_mast3r()
                     if mast3r is not None:
                         for i, match in enumerate(candidates_to_check):
+                            if self.cancel_search.is_set():
+                                q.put(('status', "Search cancelled."))
+                                break
                             q.put(('progress', i, len(candidates_to_check)))
                             q.put(('status', f"MASt3R Match: {i+1}/{len(candidates_to_check)}"))
                             pid = match.get('panoid')
