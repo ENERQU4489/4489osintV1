@@ -138,20 +138,22 @@ def create_bundle(index_dir, output_path, name, description, center_lat, center_
 
     print(f"[HUB] Geographic filter: {len(valid_idx)}/{len(descs)} entries within {radius_km}km")
 
-    # Extract filtered subset
-    filtered_descs = np.array(descs[valid_idx], dtype=np.float32)
+    # Extract filtered metadata subset. Descriptors are NOT materialized here —
+    # np.array(descs[valid_idx]) would copy the whole multi-GB subset into RAM
+    # and get the process OOM-killed on large areas; they are streamed to disk
+    # in chunks below instead.
     filtered_lats = lats[valid_idx]
     filtered_lons = lons[valid_idx]
     filtered_headings = meta['headings'][valid_idx]
     filtered_panoids = meta['panoids'][valid_idx]
     filtered_paths = meta['paths'][valid_idx]
-    
-    num_entries = len(filtered_descs)
-    desc_dim = filtered_descs.shape[1]
+
+    num_entries = len(valid_idx)
+    desc_dim = descs.shape[1]
     panoid_set = set(str(p) for p in filtered_panoids)
     num_panoids = len(panoid_set)
-    
-    del descs, meta
+
+    del meta
 
     # Build manifest
     manifest = {
@@ -178,19 +180,30 @@ def create_bundle(index_dir, output_path, name, description, center_lat, center_
     # Create ZIP bundle with FILTERED data
     print(f"[HUB] Creating bundle: {name} ({num_entries} entries, {num_panoids} panoids)")
     
-    # Save filtered arrays to temp files, then zip them
-    tmp_dir = tempfile.mkdtemp(prefix="netryx_bundle_")
+    # Save filtered arrays to temp files, then zip them. Temp lives next to the
+    # output so multi-GB staging doesn't fill the system disk.
+    tmp_dir = tempfile.mkdtemp(prefix="netryx_bundle_",
+                               dir=os.path.dirname(os.path.abspath(output_path)) or None)
     try:
         tmp_descs = os.path.join(tmp_dir, "descriptors.npy")
         tmp_meta = os.path.join(tmp_dir, "metadata.npz")
-        
-        np.save(tmp_descs, filtered_descs)
+
+        # Stream descriptors mmap -> disk in chunks (bounded RAM)
+        out_descs = np.lib.format.open_memmap(
+            tmp_descs, mode='w+', dtype=np.float32, shape=(num_entries, desc_dim))
+        CHUNK = 100_000
+        for s in range(0, num_entries, CHUNK):
+            idx_chunk = valid_idx[s:s + CHUNK]
+            out_descs[s:s + len(idx_chunk)] = descs[idx_chunk]
+        out_descs.flush()
+        del out_descs, descs
+
         np.savez_compressed(tmp_meta,
             lats=filtered_lats, lons=filtered_lons,
             headings=filtered_headings, panoids=filtered_panoids,
             paths=filtered_paths)
-        
-        del filtered_descs, filtered_lats, filtered_lons
+
+        del filtered_lats, filtered_lons
         del filtered_headings, filtered_panoids, filtered_paths
         
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
@@ -204,8 +217,12 @@ def create_bundle(index_dir, output_path, name, description, center_lat, center_
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Compute SHA256
-    sha = hashlib.sha256(open(output_path, 'rb').read()).hexdigest()
+    # Compute SHA256 (streamed — reading a multi-GB bundle whole would OOM)
+    _h = hashlib.sha256()
+    with open(output_path, 'rb') as _f:
+        for _blk in iter(lambda: _f.read(1 << 24), b''):
+            _h.update(_blk)
+    sha = _h.hexdigest()
     manifest["sha256"] = sha
     manifest["file_size_bytes"] = os.path.getsize(output_path)
 
@@ -573,8 +590,12 @@ class NetryxHub:
         print(f"[HUB] Preparing upload: {name}")
         print(f"[HUB] Repo: {repo_id}")
 
-        # Create bundle
-        bundle_path = os.path.join(tempfile.gettempdir(), f"{city.lower()}_{int(radius_km)}km.netryx")
+        # Create bundle — staged next to the index, not in system temp: bundles
+        # can be many GB and the OS disk may not have room (staging inherits
+        # this location too, see create_bundle)
+        bundle_path = os.path.join(
+            os.path.dirname(os.path.abspath(index_dir)) or tempfile.gettempdir(),
+            f"{city.lower()}_{int(radius_km)}km.netryx")
         bundle_path, manifest = create_bundle(
             index_dir=index_dir,
             output_path=bundle_path,
