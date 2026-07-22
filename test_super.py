@@ -189,7 +189,8 @@ def panoids_from_response(text):
     return filtered
 
 def tiles_info(panoid):
-    image_url = "http://cbk0.google.com/cbk?output=tile&panoid={0:}&zoom=2&x={1:}&y={2:}"
+    # cbk0.google.com now returns 403 for all requests; use the current tile endpoint
+    image_url = "https://streetviewpixels-pa.googleapis.com/v1/tile?cb_client=maps_sv.tactile&panoid={0:}&x={1:}&y={2:}&zoom=2&nbt=1&fover=2"
     coord = list(itertools.product(range(IMGX), range(IMGY)))
     tiles = [(x, y, "%s_%dx%d.jpg" % (panoid, x, y), image_url.format(panoid, x, y)) for x, y in coord]
     return tiles
@@ -210,7 +211,12 @@ def download_tiles(tiles, status_callback=None, max_workers=64):
     results = {}
     async def main():
         connector = aiohttp.TCPConnector(limit=max_workers)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        # Google endpoints 403 without browser-like headers
+        _headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Referer": "https://www.google.com/maps/",
+        }
+        async with aiohttp.ClientSession(connector=connector, headers=_headers) as session:
             tasks = []
             for i, (x, y, fname, url) in enumerate(tiles):
                 tasks.append(download_tile_aiohttp(session, x, y, fname, url))
@@ -293,7 +299,12 @@ def get_panoids(points, status_callback=None, max_workers=64):
 
     async def main():
         connector = aiohttp.TCPConnector(limit=max_workers)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        # Google endpoints 403 without browser-like headers
+        _headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Referer": "https://www.google.com/maps/",
+        }
+        async with aiohttp.ClientSession(connector=connector, headers=_headers) as session:
             tasks = []
             for idx, (lat, lon) in enumerate(points):
                 task = asyncio.create_task(fetch_one(session, idx, lat, lon))
