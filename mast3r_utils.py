@@ -91,9 +91,9 @@ def get_mast3r_model():
         print(f"[MASt3R] Error loading model: {e}")
         raise e
     
-    # use reduce overhead since mast3r runs a lot so its worth the upfron compile time
-    with autocast(device, dtype=torch.bfloat16):
-        _mast3r_model = torch.compile(_mast3r_model, mode='reduce-overhead')
+    # NOTE: torch.compile disabled — inductor's clang invocation breaks when the
+    # project path contains a space (unquoted -L flag), crashing on first inference.
+    # The model runs fine uncompiled, just slightly slower per candidate.
     return _mast3r_model
 
 def get_mast3r_matches(img1_pil, img2_pil, model, image_size=512):
