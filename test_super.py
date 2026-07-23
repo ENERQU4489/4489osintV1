@@ -99,6 +99,58 @@ COMPACT_DESCS_PATH = os.path.join(COMPACT_INDEX_DIR, "megaloc_descriptors.npy")
 COMPACT_META_PATH = os.path.join(COMPACT_INDEX_DIR, "metadata.npz")
 COMPACT_INFO_PATH = os.path.join(COMPACT_INDEX_DIR, "index_info.txt")
 
+# ── Encoder abstraction (MegaLoc | MixVPR) ──────────────────────────────────
+# The retrieval encoder is switchable. Each encoder has its OWN parts + index
+# dir (descriptors from different models are not comparable), so switching never
+# corrupts or mixes indexes. set_encoder() reassigns the path globals above so
+# the rest of the code keeps working unchanged.
+ACTIVE_ENCODER = "megaloc"
+ENCODER_USES_PCA = True          # MegaLoc: 8448-dim -> PCA. MixVPR: already compact.
+_BATCH_ENCODE = batch_extract_megaloc
+
+def set_encoder(name):
+    """Switch the active retrieval encoder and repoint all index paths to it."""
+    global ACTIVE_ENCODER, ENCODER_USES_PCA, _BATCH_ENCODE
+    global MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR, COMPACT_DESCS_PATH
+    global COMPACT_META_PATH, COMPACT_INFO_PATH, _compact_cache
+    name = (name or "megaloc").lower()
+    if name == "mixvpr":
+        import mixvpr_utils as _MX
+        _MX.get_mixvpr_model  # ensure module import succeeds early
+        MEGALOC_PARTS_DIR = os.path.join(DATA_DIR, "mixvpr_parts")
+        COMPACT_INDEX_DIR = os.path.join(DATA_DIR, "index_mixvpr")
+        descs_name = "mixvpr_descriptors.npy"
+        ENCODER_USES_PCA = False
+        _BATCH_ENCODE = _MX.batch_extract_mixvpr
+        ACTIVE_ENCODER = "mixvpr"
+    else:
+        MEGALOC_PARTS_DIR = os.path.join(DATA_DIR, "megaloc_parts")
+        COMPACT_INDEX_DIR = os.path.join(DATA_DIR, "index")
+        descs_name = "megaloc_descriptors.npy"
+        ENCODER_USES_PCA = True
+        _BATCH_ENCODE = batch_extract_megaloc
+        ACTIVE_ENCODER = "megaloc"
+    COMPACT_DESCS_PATH = os.path.join(COMPACT_INDEX_DIR, descs_name)
+    COMPACT_META_PATH = os.path.join(COMPACT_INDEX_DIR, "metadata.npz")
+    COMPACT_INFO_PATH = os.path.join(COMPACT_INDEX_DIR, "index_info.txt")
+    for d in (MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR):
+        os.makedirs(d, exist_ok=True)
+    _compact_cache = None          # force reload of the new encoder's index
+    print(f"[ENCODER] Active encoder: {ACTIVE_ENCODER} (index: {COMPACT_INDEX_DIR})")
+
+def encode_query(pil_img):
+    """Encode a query image to a search-ready descriptor for the active encoder."""
+    if ACTIVE_ENCODER == "mixvpr":
+        import mixvpr_utils as _MX
+        return _MX.extract_mixvpr_descriptor(pil_img)
+    return extract_megaloc_descriptor(pil_img, apply_pca_reduction=True)
+
+def batch_encode(pil_images, batch_size=None):
+    """Batch-encode crops for indexing with the active encoder."""
+    if batch_size is None:
+        return _BATCH_ENCODE(pil_images)
+    return _BATCH_ENCODE(pil_images, batch_size=batch_size)
+
 # Create dirs on startup
 for d in [DATA_DIR, MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -275,25 +327,38 @@ def grid_points(center, radius, resolution):
 
 def get_panoids(points, status_callback=None, max_workers=64):
     import csv
-    async def fetch_one(session, idx, lat, lon, max_attempts=12):
+    async def fetch_one(session, idx, lat, lon, max_attempts=3):
+        # 3 attempts + a short timeout: repeated failures are almost always
+        # genuinely empty spots (water/no coverage), so extra retries and a long
+        # timeout just add a slow tail with no extra panos found.
         url = _panoids_url(lat, lon)
-        for attempt in range(max_attempts):
+        attempt = 0
+        rate_limit_retries = 0  # 429s get their own budget so real points aren't dropped
+        while attempt < max_attempts:
             try:
-                async with session.get(url, timeout=120) as resp:
+                async with session.get(url, timeout=15) as resp:
                     status = resp.status
                     text = await resp.text()
                     if status == 429:
-                        await asyncio.sleep(1)
-                        continue
+                        # Transient throttling — back off and retry without
+                        # consuming the fast-fail budget (up to a cap).
+                        if rate_limit_retries < 5:
+                            rate_limit_retries += 1
+                            await asyncio.sleep(min(2 ** rate_limit_retries, 10))
+                            continue
+                        return []
                     elif status != 200:
+                        attempt += 1
                         continue
                     pans = panoids_from_response(text)
                     if not pans:
                         return []
                     return pans
             except asyncio.TimeoutError:
+                attempt += 1
                 await asyncio.sleep(0.5)
-            except Exception as e:
+            except Exception:
+                attempt += 1
                 await asyncio.sleep(0.5)
         return []
 
@@ -960,6 +1025,7 @@ class StreetViewMatcherGUI:
         self.query_img_path = None
         self.mode_var = tk.StringVar(value="create")
         self.search_option_var = tk.StringVar(value="manual")
+        self.encoder_var = tk.StringVar(value=ACTIVE_ENCODER)
         self.hf_token_var = tk.StringVar(value=os.getenv("HF_TOKEN", ""))
 
         # theme and styles
@@ -1042,6 +1108,16 @@ class StreetViewMatcherGUI:
         opt_frm = tk.Frame(left_ctrl, bg='#0a0a0f')
         opt_frm.grid(row=2, column=1, sticky='w')
         RoundedRadio(opt_frm, text="Manual", variable=self.search_option_var, value="manual").grid(row=0, column=1, padx=5)
+
+        # Encoder toggle (MegaLoc / MixVPR) — each uses its own separate index
+        ttk.Label(left_ctrl, text="Encoder", style='Section.TLabel').grid(row=8, column=0, sticky='w', pady=(8, 8))
+        enc_frm = tk.Frame(left_ctrl, bg='#0a0a0f')
+        enc_frm.grid(row=8, column=1, sticky='w')
+        self.encoder_frame = enc_frm
+        RoundedRadio(enc_frm, text="MegaLoc", variable=self.encoder_var, value="megaloc",
+                     command=self._on_encoder_change).grid(row=0, column=0, padx=5)
+        RoundedRadio(enc_frm, text="MixVPR", variable=self.encoder_var, value="mixvpr",
+                     command=self._on_encoder_change).grid(row=0, column=1, padx=5)
 
         # Parameters
         ttk.Label(left_ctrl, text="Parameters", style='Section.TLabel').grid(row=3, column=0, columnspan=2, sticky='w', pady=(15, 10))
@@ -1218,6 +1294,23 @@ class StreetViewMatcherGUI:
         # First-run onboarding tour (non-blocking; only if never seen)
         self.master.after(600, lambda: self.show_tutorial(force=False))
 
+    def _on_encoder_change(self):
+        """Switch retrieval encoder. Each encoder has its own separate index."""
+        name = self.encoder_var.get()
+        try:
+            set_encoder(name)
+        except Exception as e:
+            self._set_status(f"Encoder '{name}' unavailable: {e}")
+            self.encoder_var.set("megaloc")
+            set_encoder("megaloc")
+            return
+        # Warn if this encoder has no index yet (they don't share indexes)
+        if os.path.exists(COMPACT_DESCS_PATH):
+            self._set_status(f"Encoder: {name.upper()} — index ready.")
+        else:
+            self._set_status(f"Encoder: {name.upper()} — no index yet for this encoder. "
+                             f"Use Create mode to build one (its index is separate from MegaLoc's).")
+
     def show_tutorial(self, force=False):
         """First-run guided tour. Skipped if already seen unless force=True.
 
@@ -1252,6 +1345,16 @@ class StreetViewMatcherGUI:
              "• Create — build your OWN index for an area by downloading its Street "
              "View. Only needed for places nobody has shared on the Hub yet.",
              lambda: getattr(self, 'mode_frame', None)),
+            ("Choose an encoder: MegaLoc vs MixVPR",
+             "The encoder is the model that fingerprints images for the first-pass search. "
+             "Two options, each with its OWN separate index:\n\n"
+             "• MegaLoc (default) — highest accuracy/recall, best for hard photos. Slower to "
+             "index and ~16x larger index files.\n"
+             "• MixVPR — ~3-4x faster to index and much smaller indexes, with slightly lower "
+             "recall on difficult shots. Great for quickly indexing a new area.\n\n"
+             "They can't share an index — a MegaLoc index is searched with MegaLoc, a MixVPR "
+             "index with MixVPR. MASt3R does the precise matching either way.",
+             lambda: getattr(self, 'encoder_frame', None)),
             ("Load your photo",
              "Click the image box (“No image selected”) and choose a street-level "
              "photo — a building facade, a street corner, storefronts.\n\n"
@@ -1530,7 +1633,7 @@ class StreetViewMatcherGUI:
                     total_extracted += len(meta)
 
                     crops_pil = [tensor_to_pil(c) for c in crops]
-                    cos_descs = batch_extract_megaloc(crops_pil, batch_size=len(crops))
+                    cos_descs = batch_encode(crops_pil, batch_size=len(crops))
                     megaloc_buffer_descs.append(cos_descs)
                     megaloc_buffer_paths.extend([m['path'] for m in meta])
                     megaloc_buffer_lats.extend([m['lat'] for m in meta])
@@ -1748,29 +1851,31 @@ class StreetViewMatcherGUI:
         early_exit_event = threading.Event()
 
         try:
-            # STEP 4 Migration: Load PCA
-            pca_path = os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
-            if os.path.exists(pca_path):
-                from megaloc_utils import load_pca, _pca_model
-                if _pca_model is None:
-                    load_pca(pca_path)
-            
+            # Load PCA only for encoders that use it (MegaLoc). MixVPR descriptors
+            # are already compact and searched directly.
+            if ENCODER_USES_PCA:
+                pca_path = os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
+                if os.path.exists(pca_path):
+                    from megaloc_utils import load_pca, _pca_model
+                    if _pca_model is None:
+                        load_pca(pca_path)
+
             # Step 1: Load query image
             query_img = Image.open(self.query_img_path).convert("RGB")
             query_img_resize = query_img.resize((crop_size, crop_size), Image.BILINEAR)
             self.current_search_context = (query_img_resize, crop_fov, crop_size, center, radius)
 
-            # Step 2: get the MegaLoc desc (multiscale)
-            q.put(('status', "Extracting query MegaLoc descriptor (multi-scale)..."))
+            # Step 2: get the query descriptor (multiscale) via the active encoder
+            q.put(('status', f"Extracting query descriptor ({ACTIVE_ENCODER}, multi-scale)..."))
             query_for_megaloc = query_img_resize
-            desc_original = extract_megaloc_descriptor(query_for_megaloc, apply_pca_reduction=True)
+            desc_original = encode_query(query_for_megaloc)
 
             # Slight zoom in (center crop 80%) — matches closer viewpoints
             w, h = query_img_resize.size
             margin_x, margin_y = int(w * 0.1), int(h * 0.1)
             cropped = query_img_resize.crop((margin_x, margin_y, w - margin_x, h - margin_y))
             cropped = cropped.resize((crop_size, crop_size), Image.BILINEAR)
-            desc_zoom = extract_megaloc_descriptor(cropped, apply_pca_reduction=True)
+            desc_zoom = encode_query(cropped)
             cropped.close()
 
             # Average: original + zoom (weighted toward original)
@@ -1779,10 +1884,9 @@ class StreetViewMatcherGUI:
 
             # Also extract flipped descriptor
             query_img_flipped = query_img_resize.transpose(Image.FLIP_LEFT_RIGHT)
-            desc_flipped = extract_megaloc_descriptor(query_img_flipped, apply_pca_reduction=True)
-            desc_flipped_zoom = extract_megaloc_descriptor(
-                query_img_flipped.crop((margin_x, margin_y, w - margin_x, h - margin_y)).resize((crop_size, crop_size), Image.BILINEAR),
-                apply_pca_reduction=True
+            desc_flipped = encode_query(query_img_flipped)
+            desc_flipped_zoom = encode_query(
+                query_img_flipped.crop((margin_x, margin_y, w - margin_x, h - margin_y)).resize((crop_size, crop_size), Image.BILINEAR)
             )
             desc_flipped = 0.65 * desc_flipped + 0.35 * desc_flipped_zoom
             desc_flipped = desc_flipped / (np.linalg.norm(desc_flipped) + 1e-8)
@@ -2299,8 +2403,10 @@ class StreetViewMatcherGUI:
                         size_mb = idx.get('file_size_bytes', 0) / 1024 / 1024
                         author = idx.get('author', '?')
                         badge = "🟣 Official" if idx.get('is_official') else "🟢 Community"
-                        
-                        line = f"📦 {idx['name']:<18} | {idx['radius_km']:>3}km | {idx['num_entries']:>6,} pts | {size_mb:>4.0f}MB | {badge} by @{author}"
+                        enc = idx.get('encoder') or ('mixvpr' if 'MixVPR' in str(idx.get('descriptor_model','')) else 'megaloc')
+                        enc_tag = "MixVPR" if enc == 'mixvpr' else "MegaLoc"
+
+                        line = f"📦 {idx['name']:<16} | {enc_tag:<7} | {idx['radius_km']:>3}km | {idx['num_entries']:>6,} pts | {size_mb:>4.0f}MB | {badge} by @{author}"
                         self._hub_listbox.insert('end', line)
                     self._hub_status.config(text=f"Found {len(indexes)} indexes")
 
@@ -2332,8 +2438,10 @@ class StreetViewMatcherGUI:
                         size_mb = idx.get('file_size_bytes', 0) / 1024 / 1024
                         author = idx.get('author', '?')
                         badge = "🟣 Official" if idx.get('is_official') else "🟢 Community"
-                        
-                        line = f"📦 {idx['name']:<18} | {idx['radius_km']:>3}km | {idx['num_entries']:>6,} pts | {size_mb:>4.0f}MB | {badge} by @{author}"
+                        enc = idx.get('encoder') or ('mixvpr' if 'MixVPR' in str(idx.get('descriptor_model','')) else 'megaloc')
+                        enc_tag = "MixVPR" if enc == 'mixvpr' else "MegaLoc"
+
+                        line = f"📦 {idx['name']:<16} | {enc_tag:<7} | {idx['radius_km']:>3}km | {idx['num_entries']:>6,} pts | {size_mb:>4.0f}MB | {badge} by @{author}"
                         self._hub_listbox.insert('end', line)
                     self._hub_status.config(text=f"Found {len(results)} indexes for '{query}'")
 
@@ -2354,14 +2462,27 @@ class StreetViewMatcherGUI:
         repo_id = idx.get('repo_id', '')
         name = idx.get('name', 'Unknown')
 
-        self._hub_status.config(text=f"Downloading {name}...")
+        # A downloaded index must land in its own encoder's directory. Switch the
+        # active encoder to match the index type before downloading.
+        target_enc = idx.get('encoder') or ('mixvpr' if 'MixVPR' in str(idx.get('descriptor_model', '')) else 'megaloc')
+        if target_enc != ACTIVE_ENCODER:
+            try:
+                set_encoder(target_enc)
+                self.encoder_var.set(target_enc)
+                self._set_status(f"Switched encoder to {target_enc.upper()} for this index.")
+            except Exception as e:
+                self._hub_status.config(text=f"Cannot use {target_enc} index: {e}")
+                return
+        dest_dir = COMPACT_INDEX_DIR
+
+        self._hub_status.config(text=f"Downloading {name} ({target_enc.upper()})...")
         hub_win.update_idletasks()
 
         def do_download():
             try:
                 hub = NetryxHub()
                 manifest = hub.download(
-                    repo_id, COMPACT_INDEX_DIR,
+                    repo_id, dest_dir,
                     progress_callback=lambda msg: self.master.after(0, lambda m=msg: self._hub_status.config(text=m))
                 )
 
@@ -2398,7 +2519,10 @@ class StreetViewMatcherGUI:
         upload_win.transient(hub_win)
 
         tk.Label(upload_win, text="Upload to Community Hub", font=('SF Pro Display', 16, 'bold'),
-                 bg='#0a0a0f', fg='#ffffff').pack(pady=(20, 15))
+                 bg='#0a0a0f', fg='#ffffff').pack(pady=(20, 5))
+        # Show which encoder this index was built with (uploaded as that type)
+        tk.Label(upload_win, text=f"Encoder: {ACTIVE_ENCODER.upper()}  (index type is fixed to how it was built)",
+                 font=('Avenir Next', 9), bg='#0a0a0f', fg='#a78bfa').pack(pady=(0, 12))
 
         fields_frame = tk.Frame(upload_win, bg='#0a0a0f')
         fields_frame.pack(padx=20, fill='x')
@@ -2456,6 +2580,7 @@ class StreetViewMatcherGUI:
                         center_lat=float(lat_var.get()),
                         center_lon=float(lon_var.get()),
                         tags=tags,
+                        encoder=ACTIVE_ENCODER,
                     )
                     self.master.after(0, lambda: status_lbl.config(text=f"✅ Uploaded! {url}"))
                     self.master.after(0, lambda: self._hub_status.config(text=f"Uploaded {city}!"))
