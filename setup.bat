@@ -61,12 +61,6 @@ if not exist "venv" (
 call venv\Scripts\activate.bat
 echo [OK] Virtual environment activated
 
-:: Install dependencies
-echo.
-echo [SETUP] Installing Python dependencies ^(this takes a few minutes^)...
-python -m pip install --upgrade pip -q
-python -m pip install -r requirements.txt -q
-
 :: Force python to install a version of Torch compatible with CUDA
 echo Checking for NVIDIA GPU...
 
@@ -79,7 +73,26 @@ if %errorlevel%==0 (
     echo [INFO] No NVIDIA GPU detected
     echo Installing CPU PyTorch...
     pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 -q
+):: Force python to install a version of Torch compatible with CUDA
+echo Checking for NVIDIA GPU...
+
+nvidia-smi >nul 2>>installer.log
+if %errorlevel%==0 (
+    echo [OK] NVIDIA GPU detected
+    echo Installing CUDA PyTorch...
+    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 -q
+) else (
+    echo [INFO] No NVIDIA GPU detected
+    echo Installing CPU PyTorch...
+    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 -q
 )
+
+:: Install dependencies
+echo.
+echo [SETUP] Installing Python dependencies ^(this takes a few minutes^)...
+python -m pip install --upgrade pip -q
+python -m pip install -r requirements.txt -q
+
 echo [OK] Dependencies installed
 
 :: Clone MASt3R

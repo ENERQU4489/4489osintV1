@@ -58,12 +58,6 @@ fi
 source venv/bin/activate 2>installer.log || source venv/Scripts/activate 2>installer.log
 echo "[OK] Virtual environment activated"
 
-# Install dependencies
-echo ""
-echo "[SETUP] Installing Python dependencies (this takes a few minutes)..."
-python3 -m pip install --upgrade pip -q
-python3 -m pip install -r requirements.txt -q
-
 echo "Checking for NVIDIA GPU..."
 if command -v nvidia-smi &> /dev/null; then
     echo "[OK] NVIDIA GPU detected"
@@ -74,6 +68,12 @@ else
     echo "Installing CPU PyTorch..."
     python3 -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
 fi
+
+# Install dependencies
+echo ""
+echo "[SETUP] Installing Python dependencies (this takes a few minutes)..."
+python3 -m pip install --upgrade pip -q
+python3 -m pip install -r requirements.txt -q
 echo "[OK] Dependencies installed"
 
 # Clone MASt3R
