@@ -62,7 +62,7 @@ cd "$SCRIPT_DIR"
 python3 -c "
 import torch
 try:
-    model = torch.hub.load('gmberton/MegaLoc', 'get_trained_model')
+    model = torch.hub.load('gmberton/MegaLoc', 'get_trained_model', trust_repo=True)
     print('✅ MegaLoc weights downloaded')
 except Exception as e:
     print(f'⚠️  MegaLoc download failed: {e}')

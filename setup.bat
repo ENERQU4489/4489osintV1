@@ -64,7 +64,7 @@ cd /d "%NETRYX_DIR%"
 :: Pre-download MegaLoc weights
 echo.
 echo [SETUP] Downloading MegaLoc model weights ^(first time only^)...
-python -c "import torch; model = torch.hub.load('gmberton/MegaLoc', 'get_trained_model'); print('[OK] MegaLoc ready')" 2>nul
+python -c "import torch; model = torch.hub.load('gmberton/MegaLoc', 'get_trained_model', trust_repo=True); print('[OK] MegaLoc ready')" 2>nul
 if errorlevel 1 echo [WARN] MegaLoc download failed - will retry on first run
 
 :: Pre-download MASt3R weights
