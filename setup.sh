@@ -74,6 +74,7 @@ echo ""
 echo "[SETUP] Installing Python dependencies (this takes a few minutes)..."
 python3 -m pip install --upgrade pip -q
 python3 -m pip install -r requirements.txt -q
+python3 -m pip install --upgrade triton -q
 echo "[OK] Dependencies installed"
 
 # Clone MASt3R
@@ -110,6 +111,12 @@ python3 -c "import sys,os; p=os.path.abspath(os.path.join('$SCRIPT_DIR','..','ma
 if [ $? -ne 0 ]; then
     echo "[WARN] MASt3R download failed - will retry on first run"
 fi
+
+# Install MixVPR
+echo "Installing MixVPR (this may take a few minutes)..."
+cd "$HOME/.cache/torch/hub"
+git clone https://github.com/gmberton/VPR-methods-evaluation.git gmberton_VPR-methods-evaluation_master
+echo "[OK] MixVPR installed"
 
 # Create data dirs
 cd "$SCRIPT_DIR"

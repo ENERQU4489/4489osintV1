@@ -125,11 +125,21 @@ echo [SETUP] Downloading MASt3R model weights ^(~1.2GB, first time only^)...
 python -c "import sys,os; p=os.path.abspath(os.path.join(r'%NETRYX_DIR%','..','mast3r')); sys.path.insert(0,p); sys.path.insert(0,os.path.join(p,'dust3r')); from mast3r.model import AsymmetricMASt3R; m=AsymmetricMASt3R.from_pretrained('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric'); print('[OK] MASt3R ready')" 2>>installer.log
 if errorlevel 1 echo [WARN] MASt3R download failed - will retry on first run
 
+:: Install MixVPR
+echo [SETUP] Installing MixVPR ^(this may take a few minutes^)...
+cd "%USERPROFILE%\.cache\torch\hub"
+git clone https://github.com/gmberton/VPR-methods-evaluation.git gmberton_VPR-methods-evaluation_master
+echo [OK] MixVPR installed
+
 :: Create data dirs
 cd /d "%NETRYX_DIR%"
 mkdir netryx_data\megaloc_parts 2>>installer.log
 mkdir netryx_data\index 2>>installer.log
 echo [OK] Data directories created
+
+:: Disable Triton for windows beacause it is not supported
+setx TORCH_COMPILE_DISABLE "1"
+set TORCH_COMPILE_DISABLE=1
 
 :: Done
 echo.
