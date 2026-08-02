@@ -18,6 +18,7 @@ import threading
 import queue
 import time
 import json
+import uuid
 import random
 import glob
 import cv2
@@ -36,18 +37,35 @@ from megaloc_utils import (
     MEGALOC_RAW_DIM, MEGALOC_PCA_DIM
 )
 import gc
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 #PCA matching dimensions
 INDEX_TARGET_DIM = 1024
 
 # performance tuning
-MAX_PANOID_WORKERS = 32
+# performance tuning
+MAX_PANOID_WORKERS = 128
 MAX_HEADING_WORKERS = 4
 MAX_DOWNLOAD_WORKERS = 120
 MAX_MATCH_WORKERS = 16
 EARLY_EXIT_INLIER_THRESHOLD = 300
 MEGALOC_BATCH_SIZE = 64  # descriptors are identical at any batch size; larger = better GPU utilization
 CROP_QUEUE_SIZE =  1024
+
+# Each panoid API call already searches a radius around the query point
+# (the "2d50" param in _panoids_url — 50 meters) and returns every pano
+# Google finds inside it, not just the one nearest the exact coordinate.
+# Grid points closer together than this radius search overlapping circles
+# and mostly rediscover the same panos, which is pure wasted API calls.
+# PANOID_SEARCH_RADIUS_M must match the "2d{N}" value in _panoids_url below
+# -- if you change one, change the other.
+PANOID_SEARCH_RADIUS_M = 50
+# Grid spacing = radius * this factor. <1.0 leaves deliberate overlap so
+# thin strips of coverage (e.g. a road running between two grid points)
+# don't get missed; 1.0 is the "just barely touching" tiling. Don't push
+# above ~1.0 or genuine gaps start opening up between search circles.
+GRID_SPACING_OVERLAP_FACTOR = 0.85
 
 
 #Device and model steup stuff
@@ -94,10 +112,22 @@ else:
 
 MEGALOC_PARTS_DIR = os.path.join(DATA_DIR, "megaloc_parts")
 EMB_CSV = os.path.join(DATA_DIR, "embeddings_index.csv")
-COMPACT_INDEX_DIR = os.path.join(DATA_DIR, "index")
-COMPACT_DESCS_PATH = os.path.join(COMPACT_INDEX_DIR, "megaloc_descriptors.npy")
-COMPACT_META_PATH = os.path.join(COMPACT_INDEX_DIR, "metadata.npz")
-COMPACT_INFO_PATH = os.path.join(COMPACT_INDEX_DIR, "index_info.txt")
+INDEXES_DIR = os.path.join(DATA_DIR, "indexes")
+# COMPACT_INDEX_DIR and friends now point at whatever index load_index()/
+# build_compact_index() last activated, under INDEXES_DIR/{uuid}/. There is
+# no more single default "index" folder — an index must be built or loaded
+# before these paths are meaningful.
+COMPACT_INDEX_DIR = None
+COMPACT_DESCS_PATH = None
+COMPACT_META_PATH = None
+COMPACT_INFO_PATH = None
+COMPACT_PCA_PATH = None
+
+def has_active_index():
+    """True if an index has been built or loaded this session. Guard any
+    COMPACT_* path access with this -- they are None until load_index()
+    or build_compact_index() runs."""
+    return COMPACT_INDEX_DIR is not None
 
 # ── Encoder abstraction (MegaLoc | MixVPR) ──────────────────────────────────
 # The retrieval encoder is switchable. Each encoder has its OWN parts + index
@@ -108,35 +138,55 @@ ACTIVE_ENCODER = "megaloc"
 ENCODER_USES_PCA = True          # MegaLoc: 8448-dim -> PCA. MixVPR: already compact.
 _BATCH_ENCODE = batch_extract_megaloc
 
+os.makedirs(INDEXES_DIR, exist_ok=True)
+
 def set_encoder(name):
-    """Switch the active retrieval encoder and repoint all index paths to it."""
+    """Switch the active retrieval encoder for the NEXT indexing run.
+
+    This only controls where raw part files get written (each encoder has
+    its own parts dir, since descriptors from different models aren't
+    comparable) and which encoder build_compact_index() will use. It does
+    NOT point at an index anymore -- indexes are UUID-keyed under
+    INDEXES_DIR and are selected with load_index(), not set_encoder().
+    Any COMPACT_* globals get cleared here so stale paths from a previously
+    loaded index can't silently leak into a new build.
+    """
     global ACTIVE_ENCODER, ENCODER_USES_PCA, _BATCH_ENCODE
     global MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR, COMPACT_DESCS_PATH
-    global COMPACT_META_PATH, COMPACT_INFO_PATH, _compact_cache
+    global COMPACT_META_PATH, COMPACT_INFO_PATH, COMPACT_PCA_PATH, _compact_cache
     name = (name or "megaloc").lower()
+
+    # No-op if this encoder is already active AND an index is currently
+    # loaded. Without this, any redundant call (re-clicking the same radio
+    # button, a caller re-asserting the encoder defensively, etc.) silently
+    # unloads a perfectly good index for no reason -- the caller wanted to
+    # confirm the encoder, not wipe the loaded index.
+    if name == ACTIVE_ENCODER and has_active_index():
+        return
+
     if name == "mixvpr":
         import mixvpr_utils as _MX
         _MX.get_mixvpr_model  # ensure module import succeeds early
         MEGALOC_PARTS_DIR = os.path.join(DATA_DIR, "mixvpr_parts")
-        COMPACT_INDEX_DIR = os.path.join(DATA_DIR, "index_mixvpr")
-        descs_name = "mixvpr_descriptors.npy"
         ENCODER_USES_PCA = False
         _BATCH_ENCODE = _MX.batch_extract_mixvpr
         ACTIVE_ENCODER = "mixvpr"
     else:
         MEGALOC_PARTS_DIR = os.path.join(DATA_DIR, "megaloc_parts")
-        COMPACT_INDEX_DIR = os.path.join(DATA_DIR, "index")
-        descs_name = "megaloc_descriptors.npy"
         ENCODER_USES_PCA = True
         _BATCH_ENCODE = batch_extract_megaloc
         ACTIVE_ENCODER = "megaloc"
-    COMPACT_DESCS_PATH = os.path.join(COMPACT_INDEX_DIR, descs_name)
-    COMPACT_META_PATH = os.path.join(COMPACT_INDEX_DIR, "metadata.npz")
-    COMPACT_INFO_PATH = os.path.join(COMPACT_INDEX_DIR, "index_info.txt")
-    for d in (MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR):
-        os.makedirs(d, exist_ok=True)
-    _compact_cache = None          # force reload of the new encoder's index
-    print(f"[ENCODER] Active encoder: {ACTIVE_ENCODER} (index: {COMPACT_INDEX_DIR})")
+    os.makedirs(MEGALOC_PARTS_DIR, exist_ok=True)
+    os.makedirs(INDEXES_DIR, exist_ok=True)
+    # Clear any previously loaded index's paths -- caller must build a new
+    # index or load_index() an existing one before searching/building again.
+    COMPACT_INDEX_DIR = None
+    COMPACT_DESCS_PATH = None
+    COMPACT_META_PATH = None
+    COMPACT_INFO_PATH = None
+    COMPACT_PCA_PATH = None
+    _compact_cache = None
+    print(f"[ENCODER] Active encoder: {ACTIVE_ENCODER} (parts: {MEGALOC_PARTS_DIR})")
 
 def encode_query(pil_img):
     """Encode a query image to a search-ready descriptor for the active encoder."""
@@ -151,8 +201,9 @@ def batch_encode(pil_images, batch_size=None):
         return _BATCH_ENCODE(pil_images)
     return _BATCH_ENCODE(pil_images, batch_size=batch_size)
 
-# Create dirs on startup
-for d in [DATA_DIR, MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR]:
+# Create dirs on startup. COMPACT_INDEX_DIR is intentionally excluded --
+# it's None until an index is built or loaded via load_index().
+for d in [DATA_DIR, MEGALOC_PARTS_DIR, INDEXES_DIR]:
     os.makedirs(d, exist_ok=True)
 
 _mps_cleanup_counter = 0
@@ -188,7 +239,151 @@ def tensor_to_pil(t):
         t = t.squeeze(2)
     return Image.fromarray(t)
 
+def scan_indexes():
+    indexes = []
 
+    indexes_dir = os.path.join(DATA_DIR, "indexes")
+
+    if not os.path.exists(indexes_dir):
+        return indexes
+
+    for index_id in os.listdir(indexes_dir):
+        index_path = os.path.join(indexes_dir, index_id)
+        manifest_path = os.path.join(index_path, "manifest.json")
+
+        if not os.path.isfile(manifest_path):
+            continue
+
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+
+            manifest["path"] = index_path
+            manifest["index_id"] = index_id
+            if "coverage_center" not in manifest:
+                manifest["coverage_center"] = {
+                    "lat": manifest.get("center_lat"),
+                    "lon": manifest.get("center_lon"),
+                }
+
+            indexes.append(manifest)
+
+        except Exception as e:
+            print(f"[INDEX] Failed loading {index_id}: {e}")
+
+    return indexes
+
+def load_index(index_id):
+    global COMPACT_INDEX_DIR
+    global COMPACT_DESCS_PATH
+    global COMPACT_META_PATH
+    global COMPACT_INFO_PATH
+    global COMPACT_PCA_PATH
+    global ACTIVE_ENCODER
+    global ENCODER_USES_PCA
+    global _compact_cache
+
+    index_path = os.path.join(INDEXES_DIR, index_id)
+
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(f"Index not found: {index_id}")
+
+    # Read manifest to determine descriptor name
+    manifest_path = os.path.join(index_path, "manifest.json")
+
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(f"manifest.json missing for index: {index_id}")
+
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+
+    # Normalize coverage fields -- Hub-built bundles use flat center_lat/
+    # center_lon/radius_km, while write_index_manifest() (used for indexes
+    # built locally in this app) nests them under coverage_center. Callers
+    # should always read manifest["coverage_center"]["lat"/"lon"] and
+    # manifest["radius_km"] after this.
+    if "coverage_center" not in manifest:
+        manifest["coverage_center"] = {
+            "lat": manifest.get("center_lat"),
+            "lon": manifest.get("center_lon"),
+        }
+
+    encoder = manifest.get("descriptor_model", "MegaLoc").lower()
+
+    # Don't blindly trust descriptor_model -- verify against what's actually
+    # on disk. A manifest can end up self-contradictory (e.g. built while
+    # ACTIVE_ENCODER said one thing but the real extraction ran as another),
+    # and trusting the label alone means load_index() looks for a filename
+    # that was never written, silently behaving as if no index exists.
+    mixvpr_path = os.path.join(index_path, "mixvpr_descriptors.npy")
+    megaloc_path = os.path.join(index_path, "megaloc_descriptors.npy")
+    mixvpr_exists = os.path.isfile(mixvpr_path)
+    megaloc_exists = os.path.isfile(megaloc_path)
+
+    if encoder == "mixvpr" and not mixvpr_exists and megaloc_exists:
+        print(f"[INDEX] WARNING: manifest for {index_id} claims 'mixvpr' but "
+              f"only megaloc_descriptors.npy exists on disk. Using megaloc "
+              f"instead (the manifest is stale/wrong, not the data).")
+        encoder = "megaloc"
+    elif encoder != "mixvpr" and not megaloc_exists and mixvpr_exists:
+        print(f"[INDEX] WARNING: manifest for {index_id} claims '{encoder}' but "
+              f"only mixvpr_descriptors.npy exists on disk. Using mixvpr "
+              f"instead (the manifest is stale/wrong, not the data).")
+        encoder = "mixvpr"
+
+    if encoder == "mixvpr":
+        desc_name = "mixvpr_descriptors.npy"
+        ENCODER_USES_PCA = False
+    else:
+        desc_name = "megaloc_descriptors.npy"
+        ENCODER_USES_PCA = True
+
+    desc_path_check = os.path.join(index_path, desc_name)
+    if not os.path.isfile(desc_path_check):
+        raise FileNotFoundError(
+            f"Index {index_id}: expected descriptor file not found at "
+            f"{desc_path_check}, and no alternate-encoder descriptor file "
+            f"was found either. This index looks incomplete or corrupted."
+        )
+
+    ACTIVE_ENCODER = encoder
+    COMPACT_INDEX_DIR = index_path
+    COMPACT_DESCS_PATH = os.path.join(index_path, desc_name)
+    COMPACT_META_PATH = os.path.join(index_path, "metadata.npz")
+    COMPACT_INFO_PATH = os.path.join(index_path, "index_info.txt")
+    COMPACT_PCA_PATH = os.path.join(index_path, "megaloc_pca.pkl")
+
+    _compact_cache = None
+
+    print(
+        f"[INDEX] Loaded {manifest.get('name', index_id)} "
+        f"({encoder})"
+    )
+
+    return manifest
+
+
+def write_index_manifest(index_dir, index_id, *, name=None, encoder="megaloc",
+                          descriptor_dim=None, num_entries=None,
+                          center_lat=None, center_lon=None, radius_km=None,
+                          format_version=1):
+    """Write manifest.json for an index dir. Called right after an index's
+    data files are saved so scan_indexes()/load_index() can discover it."""
+    manifest = {
+        "index_id": index_id,
+        "name": name or index_id,
+        "descriptor_model": encoder,
+        "descriptor_dim": descriptor_dim,
+        "num_entries": num_entries,
+        "coverage_center": {"lat": center_lat, "lon": center_lon},
+        "radius_km": radius_km,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "format_version": format_version,
+    }
+    manifest_path = os.path.join(index_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    return manifest
 
 def draw_matches(img1, img2, kp1, kp2, matches=None, color=(0, 255, 0)):
     w1, h1 = img1.size
@@ -281,6 +476,54 @@ def download_tiles(tiles, status_callback=None, max_workers=64):
     asyncio.run(main())
     return results
 
+async def _download_tiles_multi(panoid_tile_lists, max_workers=120, status_callback=None):
+    """Download tiles for MANY panoramas concurrently in ONE shared event loop
+    and ONE shared connection pool, instead of spinning up a fresh asyncio
+    loop (and a fresh TCPConnector) per panorama. Spinning up an event loop
+    per-panoid inside an already-concurrent ThreadPoolExecutor was the real
+    bottleneck here: e.g. 265 panoids meant 265 event loop start/teardown
+    cycles happening across up to 128 threads at once, each with its own
+    120-connection pool sized for just 8 tiles.
+
+    panoid_tile_lists: dict {panoid_id: [(x, y, fname, url), ...]}
+    Returns: dict {panoid_id: {(x, y): bytes}}
+    """
+    results = {pid: {} for pid in panoid_tile_lists}
+    connector = aiohttp.TCPConnector(limit=max_workers)
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Referer": "https://www.google.com/maps/",
+    }
+    total_tiles = sum(len(t) for t in panoid_tile_lists.values())
+    done = 0
+
+    async with aiohttp.ClientSession(connector=connector, headers=_headers) as session:
+        async def fetch_one(pid, x, y, fname, url):
+            nonlocal done
+            xr, yr, data = await download_tile_aiohttp(session, x, y, fname, url)
+            if data:
+                results[pid][(xr, yr)] = data
+            done += 1
+            if status_callback:
+                status_callback(done, total_tiles)
+
+        tasks = [
+            fetch_one(pid, x, y, fname, url)
+            for pid, tiles in panoid_tile_lists.items()
+            for (x, y, fname, url) in tiles
+        ]
+        await asyncio.gather(*tasks)
+
+    return results
+
+def download_tiles_for_panoids(panoid_ids, max_workers=120, status_callback=None):
+    """Sync wrapper: fetch tiles for a whole batch of panoids in one shared
+    event loop. Use this instead of calling download_tiles() once per
+    panoid inside a thread pool."""
+    panoid_tile_lists = {pid: tiles_info(pid) for pid in panoid_ids}
+    return asyncio.run(_download_tiles_multi(panoid_tile_lists, max_workers=max_workers,
+                                              status_callback=status_callback))
+
 def stitch_tiles(tiles_data):
     tile_w, tile_h = 512, 512
     import io
@@ -311,12 +554,58 @@ def haversine(p1, p2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def grid_points(center, radius, resolution):
+def haversine_vec(center_lat, center_lon, lats, lons):
+    """Vectorized haversine: distance in km from one (lat, lon) point to
+    every point in the lats/lons numpy arrays. Same formula as haversine()
+    above, just array-based instead of scalar, for computing something like
+    the max distance from a center to thousands of indexed points without
+    a Python-level loop."""
+    R = 6371
+    lat1 = math.radians(center_lat)
+    lon1 = math.radians(center_lon)
+    lat2 = np.radians(lats)
+    lon2 = np.radians(lons)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + math.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
+def grid_points(center, radius, spacing_m):
+    """Build a grid of coordinates to probe for Street View panoramas.
+
+    spacing_m: target distance in meters between adjacent grid points
+    (this is what the GUI's "Grid Resolution" field actually documents
+    itself as -- previously the code silently treated this number as a
+    point-count instead, so a 300 they typed meaning "300m apart" became
+    a 301x301 grid instead).
+
+    Each panoid API call already searches PANOID_SEARCH_RADIUS_M around its
+    query point, so spacing tighter than that just re-searches overlapping
+    areas and rediscovers the same panos -- pure wasted API calls. spacing
+    is floored here at PANOID_SEARCH_RADIUS_M * GRID_SPACING_OVERLAP_FACTOR
+    for that reason; going below it buys duplicate coverage, not real
+    coverage.
+    """
     lat, lon = center
+    min_spacing_m = PANOID_SEARCH_RADIUS_M * GRID_SPACING_OVERLAP_FACTOR
+    if spacing_m < min_spacing_m:
+        print(f"[GRID] Requested spacing {spacing_m}m is tighter than "
+              f"{PANOID_SEARCH_RADIUS_M}m search radius can usefully cover "
+              f"-- flooring to {min_spacing_m:.0f}m (tighter would just "
+              f"re-search overlapping circles).")
+        spacing_m = min_spacing_m
+
     top_left = (lat - radius / 70, lon + radius / 70)
     bottom_right = (lat + radius / 70, lon - radius / 70)
     lat_diff = top_left[0] - bottom_right[0]
     lon_diff = top_left[1] - bottom_right[1]
+
+    # Convert the requested meter spacing into a point count across the
+    # bounding box (diameter = 2 * radius, in km -> meters).
+    diameter_m = radius * 2 * 1000
+    resolution = max(1, round(diameter_m / spacing_m))
+
     test_points = list(itertools.product(range(resolution + 1), range(resolution + 1)))
     test_points = [
         (bottom_right[0] + x * lat_diff / resolution, bottom_right[1] + y * lon_diff / resolution)
@@ -495,9 +784,27 @@ def build_compact_index():
     
     Auto-applies PCA if descriptors are high-dimensional (e.g., 8448 from MegaLoc).
     """
+    global COMPACT_INDEX_DIR
+    global COMPACT_DESCS_PATH
+    global COMPACT_META_PATH
+    global COMPACT_INFO_PATH
+    global COMPACT_PCA_PATH
     global _compact_cache
     import glob
-    os.makedirs(COMPACT_INDEX_DIR, exist_ok=True)
+
+    # Capture the encoder NOW, at the start of the build, and use this
+    # captured value everywhere below -- including the final manifest write.
+    # ACTIVE_ENCODER is a live global; if anything calls set_encoder() while
+    # this build is running (a build can take a while), reading
+    # ACTIVE_ENCODER again at the end would write a manifest describing a
+    # DIFFERENT encoder than the one whose part files actually got indexed.
+    # That exact mismatch previously produced an index whose manifest said
+    # "mixvpr" while the descriptor file on disk was really MegaLoc's.
+    build_encoder = ACTIVE_ENCODER
+
+    index_id = str(uuid.uuid4())
+    index_dir = os.path.join(INDEXES_DIR, index_id)
+    os.makedirs(index_dir, exist_ok=True)
 
     megaloc_pattern = os.path.join(MEGALOC_PARTS_DIR, "megaloc_part_*.npz")
     part_files = sorted(glob.glob(megaloc_pattern))
@@ -530,8 +837,9 @@ def build_compact_index():
         
         # Fit PCA on a subsample (avoids 63GB RAM spike for 2M×8448)
         MAX_PCA_SAMPLES = 100_000
-        pca_path = os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
-        
+        COMPACT_PCA_PATH = os.path.join(index_dir, "megaloc_pca.pkl")
+        pca_path = COMPACT_PCA_PATH
+
         # Collect subsample for PCA fitting
         print(f"[INDEX] Collecting subsample for PCA fitting (max {MAX_PCA_SAMPLES})...")
         pca_samples = []
@@ -706,7 +1014,10 @@ def build_compact_index():
         norms[norms == 0] = 1
         chunk /= norms
 
-    print("[INDEX] Saving descriptors...")
+    COMPACT_INDEX_DIR = index_dir
+    COMPACT_DESCS_PATH = os.path.join(COMPACT_INDEX_DIR, "megaloc_descriptors.npy")
+    COMPACT_META_PATH = os.path.join(COMPACT_INDEX_DIR, "metadata.npz")
+    COMPACT_INFO_PATH = os.path.join(COMPACT_INDEX_DIR, "index_info.txt")
     np.save(COMPACT_DESCS_PATH, descs_valid)
     del descs_valid, all_descs
 
@@ -728,7 +1039,58 @@ def build_compact_index():
         f.write(f"Raw dim (pre-PCA): {raw_dim}\n")
         f.write(f"Total: {size_d + size_m:.1f} MB\n")
 
+    # Write manifest.json LAST, once every data file for this index exists.
+    # scan_indexes()/load_index() treat manifest.json's presence as the
+    # signal that an index is complete and safe to use -- writing it first
+    # (or not at all) would make a half-built index look ready, or make a
+    # fully-built one invisible.
+    try:
+        idx_lats = lats[valid_idx]
+        idx_lons = lons[valid_idx]
+        if len(idx_lats):
+            # Don't use a raw mean here -- for coastal/scattered coverage
+            # (e.g. points along a curving shoreline, or split across a
+            # fjord/strait), the arithmetic average of lat/lon can land in
+            # open water or otherwise nowhere any real indexed point exists,
+            # even though every actual point is on land. Instead, snap to
+            # whichever real indexed point is closest to that average, so
+            # "coverage center" is always a genuine indexed location.
+            mean_lat = float(np.mean(idx_lats))
+            mean_lon = float(np.mean(idx_lons))
+            dists_sq = (idx_lats - mean_lat) ** 2 + (idx_lons - mean_lon) ** 2
+            nearest_idx = int(np.argmin(dists_sq))
+            center_lat = float(idx_lats[nearest_idx])
+            center_lon = float(idx_lons[nearest_idx])
+
+            # radius_km was previously never computed here at all -- every
+            # manifest this function wrote had radius_km stuck at null, so
+            # the GUI's "sync radius from the loaded index" logic silently
+            # did nothing and left radius_var at whatever stale value it
+            # already had (e.g. a leftover 0.09km from an earlier search),
+            # producing a near-zero search radius around an otherwise
+            # correct center. Compute it as the true max distance from the
+            # chosen center to any indexed point, with small headroom.
+            _dists_km = haversine_vec(center_lat, center_lon, idx_lats, idx_lons)
+            radius_km = float(np.max(_dists_km)) * 1.05 if len(_dists_km) else None
+        else:
+            center_lat = center_lon = radius_km = None
+    except Exception:
+        center_lat = center_lon = radius_km = None
+
+    write_index_manifest(
+        index_dir,
+        index_id,
+        name=index_id,
+        encoder=build_encoder,
+        descriptor_dim=final_dim,
+        num_entries=len(valid_idx),
+        center_lat=center_lat,
+        center_lon=center_lon,
+        radius_km=radius_km,
+    )
+
     print(f"\n[INDEX] ✅ Saved compact index:")
+    print(f"  ID: {index_id}")
     print(f"  Descriptors: {COMPACT_DESCS_PATH} ({size_d:.1f} MB)")
     print(f"  Metadata: {COMPACT_META_PATH} ({size_m:.1f} MB)")
     print(f"  Descriptor dim: {final_dim} (from raw {raw_dim})")
@@ -744,8 +1106,8 @@ def load_compact_index():
     global _compact_cache
     if _compact_cache is not None:
         return _compact_cache
-    if not os.path.exists(COMPACT_DESCS_PATH) or not os.path.exists(COMPACT_META_PATH):
-        print("[INDEX] ERROR: Compact index not found. Run create mode first.")
+    if not has_active_index() or not os.path.exists(COMPACT_DESCS_PATH) or not os.path.exists(COMPACT_META_PATH):
+        print("[INDEX] ERROR: No active index. Build or load one first.")
         return None, None
     print("[INDEX] Loading compact index (memory-mapped)...")
     t0 = time.time()
@@ -764,7 +1126,7 @@ def load_compact_index():
     return descs, metadata
 
 
-def search_compact_index(query_desc, center, radius_km, top_k=500):
+def search_compact_index(query_desc, center, radius_km, top_k=100):
     """Search: radius filter → chunked dot-product → panoid dedup → top-K."""
     descs, metadata = load_compact_index()
     if descs is None:
@@ -787,6 +1149,22 @@ def search_compact_index(query_desc, center, radius_km, top_k=500):
     t1 = time.time()
     query_norm = query_desc / (np.linalg.norm(query_desc) + 1e-8)
     query_norm = query_norm.astype(np.float32)
+
+    # Guard against a stale/mismatched query descriptor -- e.g. the encoder
+    # radio button was switched after an index was already loaded, so
+    # ACTIVE_ENCODER (and therefore the query descriptor's dimension) no
+    # longer matches the dimension of the currently loaded index's
+    # descriptors. This used to crash deep inside the matmul with a cryptic
+    # numpy ValueError; fail clearly here instead, and don't require a
+    # rebuild -- the index on disk is fine, only the in-memory encoder
+    # selection is out of sync with what's loaded.
+    if query_norm.shape[-1] != descs.shape[-1]:
+        print(f"[INDEX] ERROR: Query descriptor is {query_norm.shape[-1]}-dim "
+              f"but the loaded index's descriptors are {descs.shape[-1]}-dim. "
+              f"The active encoder ('{ACTIVE_ENCODER}') doesn't match the "
+              f"encoder this index was built with. Re-select this index "
+              f"from 'Select Index...' to resync, then search again.")
+        return []
 
     # Chunked dot product — caps RAM at ~200MB per chunk
     CHUNK_SIZE = 100_000
@@ -1027,6 +1405,11 @@ class StreetViewMatcherGUI:
         self.search_option_var = tk.StringVar(value="manual")
         self.encoder_var = tk.StringVar(value=ACTIVE_ENCODER)
         self.hf_token_var = tk.StringVar(value=os.getenv("HF_TOKEN", ""))
+        # Index selector state. selected_index_ids can hold multiple picks
+        # in the UI, but only the first is actually activated for now --
+        # true multi-index search is future work (after MixVPR is solid).
+        self.selected_index_ids = []
+        self.index_selector_var = tk.StringVar(value="No index selected")
 
         # theme and styles
         style = ttk.Style(master)
@@ -1118,6 +1501,18 @@ class StreetViewMatcherGUI:
                      command=self._on_encoder_change).grid(row=0, column=0, padx=5)
         RoundedRadio(enc_frm, text="MixVPR", variable=self.encoder_var, value="mixvpr",
                      command=self._on_encoder_change).grid(row=0, column=1, padx=5)
+
+        # Index selector — pick which built/downloaded index to search
+        ttk.Label(left_ctrl, text="Index", style='Section.TLabel').grid(row=9, column=0, sticky='w', pady=(8, 8))
+        idx_frm = tk.Frame(left_ctrl, bg='#0a0a0f')
+        idx_frm.grid(row=9, column=1, sticky='w')
+        self.index_selector_btn = RoundedButton(idx_frm, text="Select Index...",
+            command=self.show_index_selector, width=220, height=32,
+            bg_color='#1a1a2e', hover_color='#252538', pressed_color='#12121a')
+        self.index_selector_btn.pack()
+        self.index_selector_label = tk.Label(left_ctrl, textvariable=self.index_selector_var,
+            font=('Avenir Next', 8, 'italic'), bg='#0a0a0f', fg='#6b7280', wraplength=380, justify='left')
+        self.index_selector_label.grid(row=10, column=0, columnspan=2, sticky='w', pady=(0, 5))
 
         # Parameters
         ttk.Label(left_ctrl, text="Parameters", style='Section.TLabel').grid(row=3, column=0, columnspan=2, sticky='w', pady=(15, 10))
@@ -1294,9 +1689,40 @@ class StreetViewMatcherGUI:
         # First-run onboarding tour (non-blocking; only if never seen)
         self.master.after(600, lambda: self.show_tutorial(force=False))
 
+        # Reflect whatever index (if any) __main__ already auto-loaded
+        # before this GUI was constructed.
+        if has_active_index():
+            try:
+                info_manifest = None
+                for m in scan_indexes():
+                    if COMPACT_INDEX_DIR and m.get('index_id') == os.path.basename(COMPACT_INDEX_DIR):
+                        info_manifest = m
+                        break
+                name = info_manifest.get('name') if info_manifest else os.path.basename(COMPACT_INDEX_DIR)
+                self.selected_index_ids = [info_manifest['index_id']] if info_manifest else []
+                self.index_selector_var.set(f"Active: {name}")
+                if info_manifest:
+                    cov = info_manifest.get("coverage_center", {})
+                    if cov.get("lat") is not None and cov.get("lon") is not None:
+                        self.lat_var.set(cov["lat"])
+                        self.lon_var.set(cov["lon"])
+                    if info_manifest.get("radius_km") is not None:
+                        self.radius_var.set(info_manifest["radius_km"])
+            except Exception:
+                pass
+
     def _on_encoder_change(self):
         """Switch retrieval encoder. Each encoder has its own separate index."""
         name = self.encoder_var.get()
+        # No-op if this encoder is already active -- set_encoder() always
+        # clears COMPACT_INDEX_DIR (and the loaded index with it), even when
+        # nothing actually changed. Without this guard, re-clicking the
+        # already-selected radio button (or any redundant call) silently
+        # unloads a working index for no reason, and the next search fails
+        # with "No active index" even though one was just loaded.
+        if name == ACTIVE_ENCODER and has_active_index():
+            self._set_status(f"Encoder: {name.upper()} — index ready.")
+            return
         try:
             set_encoder(name)
         except Exception as e:
@@ -1304,12 +1730,131 @@ class StreetViewMatcherGUI:
             self.encoder_var.set("megaloc")
             set_encoder("megaloc")
             return
-        # Warn if this encoder has no index yet (they don't share indexes)
-        if os.path.exists(COMPACT_DESCS_PATH):
+        # set_encoder() only prepares indexing for this encoder -- it doesn't
+        # select an index anymore. An index must be picked via load_index().
+        if has_active_index() and os.path.exists(COMPACT_DESCS_PATH):
             self._set_status(f"Encoder: {name.upper()} — index ready.")
         else:
-            self._set_status(f"Encoder: {name.upper()} — no index yet for this encoder. "
-                             f"Use Create mode to build one (its index is separate from MegaLoc's).")
+            self._set_status(f"Encoder: {name.upper()} — no index selected. "
+                             f"Load an existing {name.upper()} index or build a new one.")
+            # The "Select Index..." status label is a separate widget from
+            # the main status bar -- without clearing it too, it keeps
+            # showing "Active: <old index name>" even though set_encoder()
+            # just cleared COMPACT_INDEX_DIR, and searching produces a
+            # confusing "no candidates" result instead of an obvious
+            # "you have no index loaded" signal.
+            self.selected_index_ids = []
+            self.index_selector_var.set(f"No {name.upper()} index selected")
+
+    def show_index_selector(self):
+        """Popup listing every index found under INDEXES_DIR (manifest.json
+        present = complete). Selection is multi-pick (Ctrl/Shift/drag), but
+        only the first selected index is actually activated for search right
+        now -- true multi-index search is future work, once MixVPR is solid.
+        """
+        sel_win = tk.Toplevel(self.master)
+        sel_win.title("Select Index")
+        sel_win.configure(bg='#0a0a0f')
+        sel_win.geometry("560x480")
+        sel_win.transient(self.master)
+
+        header = tk.Frame(sel_win, bg='#0a0a0f')
+        header.pack(fill='x', padx=20, pady=(20, 10))
+        tk.Label(header, text="📍 Select Index", font=('SF Pro Display', 18, 'bold'),
+                 bg='#0a0a0f', fg='#ffffff').pack(anchor='w')
+        tk.Label(header, text="Ctrl/Cmd-click or drag to select multiple. "
+                              "Only the first pick is used for search right now --\n"
+                              "combining multiple indexes in one search is coming later.",
+                 font=('Avenir Next', 9), bg='#0a0a0f', fg='#8b5cf6', justify='left').pack(anchor='w', pady=(4, 0))
+
+        list_frame = tk.Frame(sel_win, bg='#12121a')
+        list_frame.pack(fill='both', expand=True, padx=20, pady=10)
+
+        listbox = tk.Listbox(list_frame, font=('Avenir Next', 10),
+                              bg='#12121a', fg='#f3f4f6', selectbackground='#8b5cf6',
+                              selectforeground='white', borderwidth=0,
+                              highlightthickness=0, activestyle='none',
+                              selectmode=tk.EXTENDED)
+        listbox.pack(fill='both', expand=True, side='left')
+
+        scrollbar = tk.Scrollbar(list_frame, command=listbox.yview)
+        scrollbar.pack(side='right', fill='y')
+        listbox.config(yscrollcommand=scrollbar.set)
+
+        status_lbl = tk.Label(sel_win, text="", font=('Avenir Next', 9),
+                               bg='#0a0a0f', fg='#6b7280')
+        status_lbl.pack(anchor='w', padx=20)
+
+        indexes = scan_indexes()
+        if not indexes:
+            status_lbl.config(text="No indexes found. Build one in Create mode, "
+                                    "or download one from the Community Hub.")
+        for m in indexes:
+            entries = m.get('num_entries', '?')
+            enc = m.get('descriptor_model', '?')
+            created = m.get('created', '')
+            listbox.insert(tk.END, f"{m.get('name', m.get('index_id'))}  "
+                                    f"[{enc}, {entries} entries]  {created}")
+        listbox._index_ids = [m.get('index_id') for m in indexes]
+        listbox._manifests = indexes
+
+        bottom = tk.Frame(sel_win, bg='#0a0a0f')
+        bottom.pack(fill='x', padx=20, pady=(0, 20))
+
+        def do_select():
+            sel = listbox.curselection()
+            if not sel:
+                status_lbl.config(text="Select at least one index first.")
+                return
+            picked_ids = [listbox._index_ids[i] for i in sel]
+            picked_manifests = [listbox._manifests[i] for i in sel]
+            self.selected_index_ids = picked_ids
+
+            # Activate the first pick now. Later, once MixVPR support and
+            # multi-index search land, this is where we'd fan out search
+            # across all of picked_ids instead of just loading one.
+            try:
+                loaded_manifest = load_index(picked_ids[0])
+            except Exception as e:
+                status_lbl.config(text=f"Failed to load index: {e}")
+                return
+
+            # Sync search center/radius to the loaded index's coverage --
+            # otherwise the lat/lon/radius fields stay at whatever was
+            # typed for a *different* index and every search returns 0
+            # results in the radius filter.
+            cov = loaded_manifest.get("coverage_center", {})
+            if cov.get("lat") is not None and cov.get("lon") is not None:
+                self.lat_var.set(cov["lat"])
+                self.lon_var.set(cov["lon"])
+            if loaded_manifest.get("radius_km") is not None:
+                self.radius_var.set(loaded_manifest["radius_km"])
+
+            # Clear any leftover search area from a PREVIOUS index -- the
+            # coverage map draws this as a yellow circle, and leaving it in
+            # place after switching to an unrelated index makes it look
+            # like the new index's coverage is somewhere it was never
+            # actually built (e.g. a stale circle out in open water).
+            self.search_nets = []
+
+            if len(picked_ids) == 1:
+                self.index_selector_var.set(f"Active: {picked_manifests[0].get('name', picked_ids[0])}")
+            else:
+                self.index_selector_var.set(
+                    f"Active: {picked_manifests[0].get('name', picked_ids[0])}  "
+                    f"(+{len(picked_ids) - 1} more selected, not yet combined in search)"
+                )
+            self._set_status(f"Index loaded: {picked_manifests[0].get('name', picked_ids[0])}")
+            sel_win.destroy()
+
+        select_btn = RoundedButton(bottom, text="Use Selected", command=do_select,
+                                    width=160, height=40)
+        select_btn.pack(side='left')
+
+        refresh_btn = RoundedButton(bottom, text="⟳ Refresh", command=lambda: self.show_index_selector() or sel_win.destroy(),
+                                     width=120, height=40, bg_color='#1a1a2e',
+                                     hover_color='#252538', pressed_color='#12121a')
+        refresh_btn.pack(side='left', padx=(10, 0))
 
     def show_tutorial(self, force=False):
         """First-run guided tour. Skipped if already seen unless force=True.
@@ -1549,6 +2094,16 @@ class StreetViewMatcherGUI:
                            args=(center, radius, res, fov, size, step), daemon=True).start()
             self._set_status("Creating embeddings in background...")
         else:
+            if not has_active_index():
+                self._set_status("⚠ No index selected. Click 'Select Index...' first.")
+                # A status-bar line alone is easy to miss, and this guard
+                # is exactly the kind of silent no-op that looks like "the
+                # button just doesn't do anything." Briefly flash the
+                # button text too, so a blocked click is unmistakable.
+                original_text = "▶  Run Search"
+                self.query_btn.config(text="⚠ Select an index first")
+                self.master.after(1800, lambda: self.query_btn.config(text=original_text))
+                return
             self.query()
 
     # make emdbedings for the grid
@@ -1667,17 +2222,45 @@ class StreetViewMatcherGUI:
 
         base_dirs = get_projection_base_dirs(crop_fov, (crop_size, crop_size))
 
+        # Figure out which panoids actually need downloading BEFORE touching
+        # the network at all -- previously this skip check happened inside
+        # process_one_panoid, so already-indexed panoids still paid for a
+        # ThreadPoolExecutor slot even though they did nothing.
+        panoids_needing_download = []
+        missing_yaws_by_id = {}
+        for panoid in panoids:
+            panoid_id = panoid['panoid']
+            missing = [y for y in headings_all if f"{panoid_id}_{y}.npz" not in existing_files]
+            if missing:
+                panoids_needing_download.append(panoid)
+                missing_yaws_by_id[panoid_id] = missing
+
+        skipped = len(panoids) - len(panoids_needing_download)
+
+        # Download tiles for ALL panoids that need them in ONE shared event
+        # loop / connection pool, instead of one asyncio.run() per panoid.
+        # Spinning up a fresh event loop per panoid inside an already-
+        # concurrent ThreadPoolExecutor (up to MAX_PANOID_WORKERS at once,
+        # each opening its own MAX_DOWNLOAD_WORKERS-sized pool for just 8
+        # tiles) was the actual bottleneck in this stage.
+        all_tiles_data = {}
+        if panoids_needing_download:
+            def _dl_progress(done, total):
+                q.put(('status', f"Downloading tiles: {done}/{total}..."))
+
+            all_tiles_data = download_tiles_for_panoids(
+                [p['panoid'] for p in panoids_needing_download],
+                max_workers=MAX_DOWNLOAD_WORKERS,
+                status_callback=_dl_progress,
+            )
+
         def process_one_panoid(panoid):
             panoid_id = panoid['panoid']
-
-            # Use a dummy shard path — actual storage is in eigenplace parts, not individual .npz
-            missing_yaws = [y for y in headings_all if f"{panoid_id}_{y}.npz" not in existing_files]
+            missing_yaws = missing_yaws_by_id.get(panoid_id)
             if not missing_yaws:
-                # Fully indexed already — skip the download entirely
                 return True
 
-            tiles = tiles_info(panoid_id)
-            tiles_data = download_tiles(tiles, max_workers=MAX_DOWNLOAD_WORKERS)
+            tiles_data = all_tiles_data.get(panoid_id)
             if not tiles_data:
                 return False
             try:
@@ -1690,25 +2273,28 @@ class StreetViewMatcherGUI:
 
             pano_t = pil_to_tensor(pano_img)
 
-            if missing_yaws:
-                crops_batch = equirectangular_to_rectilinear_torch(
-                    pano_t, fov_deg=crop_fov, out_hw=(crop_size, crop_size),
-                    yaw_deg=missing_yaws, pitch_deg=0, base_dirs=base_dirs
-                )
-                for i, yaw in enumerate(missing_yaws):
-                    crop_t = crops_batch[i].unsqueeze(0)
-                    emb_path = f"{panoid_id}_{yaw}.npz"
-                    meta = {'path': emb_path, 'lat': panoid['lat'], 'lon': panoid['lon'], 'yaw': yaw}
-                    crop_queue.put((crop_t, meta))
+            crops_batch = equirectangular_to_rectilinear_torch(
+                pano_t, fov_deg=crop_fov, out_hw=(crop_size, crop_size),
+                yaw_deg=missing_yaws, pitch_deg=0, base_dirs=base_dirs
+            )
+            for i, yaw in enumerate(missing_yaws):
+                crop_t = crops_batch[i].unsqueeze(0)
+                emb_path = f"{panoid_id}_{yaw}.npz"
+                meta = {'path': emb_path, 'lat': panoid['lat'], 'lon': panoid['lon'], 'yaw': yaw}
+                crop_queue.put((crop_t, meta))
 
             pano_img.close()
             del pano_t
             return True
 
+        # Stitching + equirectangular projection is CPU-bound (numpy/torch,
+        # no network waiting), so a thread pool is the right tool here --
+        # the network I/O already happened above in the shared async batch.
+        tracker.update(skipped)
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PANOID_WORKERS) as executor:
-            for idx, _ in enumerate(executor.map(process_one_panoid, panoids), 1):
+            for idx, _ in enumerate(executor.map(process_one_panoid, panoids_needing_download), skipped + 1):
                 tracker.update(idx)
-                q.put(('status', f"Downloading & Stitching: {tracker.get_status()}"))
+                q.put(('status', f"Stitching & projecting: {tracker.get_status()}"))
 
         crop_queue.put("DONE")
         extractor_thread.join()
@@ -1777,7 +2363,13 @@ class StreetViewMatcherGUI:
 
     def start_full_search(self):
         if not self.query_img_path or not self.search_nets:
-            self._set_status("No query image or search area defined.")
+            self._set_status("No query image or search area defined. Click 'Run Search' again to start over.")
+            # Without this, the button stays stuck on "Start Full Search"
+            # pointing at this same function -- clicking it again just hits
+            # this same early return forever, looking like the button
+            # silently does nothing. Reset it back to the normal entry
+            # point so a re-click actually goes through query() again.
+            self.query_btn.config(text="▶  Run Search", command=self.run)
             return
 
         self.query_btn.config(state='disabled', text="Searching...")
@@ -1854,8 +2446,11 @@ class StreetViewMatcherGUI:
             # Load PCA only for encoders that use it (MegaLoc). MixVPR descriptors
             # are already compact and searched directly.
             if ENCODER_USES_PCA:
-                pca_path = os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
-                if os.path.exists(pca_path):
+                pca_path = COMPACT_PCA_PATH or (
+                    os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
+                    if COMPACT_INDEX_DIR else None
+                )
+                if pca_path and os.path.exists(pca_path):
                     from megaloc_utils import load_pca, _pca_model
                     if _pca_model is None:
                         load_pca(pca_path)
@@ -1896,8 +2491,22 @@ class StreetViewMatcherGUI:
             # Step 3: Search compact index (original + flipped)
             q.put(('status', "Searching index (original + flipped)..."))
             K_MEGALOC = 1000
-            results_original = search_compact_index(query_desc=query_megaloc_desc, center=center, radius_km=radius, top_k=500)
-            results_flipped = search_compact_index(query_desc=desc_flipped, center=center, radius_km=radius, top_k=500)
+            # Detect an encoder/index dimension mismatch before searching so
+            # the status message is specific ("wrong encoder selected") in
+            # the UI, not just printed to console -- search_compact_index()
+            # itself also guards this and returns [], but its message only
+            # reaches the terminal.
+            _loaded_descs, _ = load_compact_index()
+            if _loaded_descs is not None and query_megaloc_desc.shape[-1] != _loaded_descs.shape[-1]:
+                q.put(('status', f"Encoder mismatch: query is {query_megaloc_desc.shape[-1]}-dim "
+                                  f"but the loaded index is {_loaded_descs.shape[-1]}-dim. "
+                                  f"Re-select the index from 'Select Index...' to resync."))
+                self.results_queue.put({'inliers': 0, 'panoid': None, 'heading': None,
+                                       'lat': None, 'lon': None, 'matches': None,
+                                       'kp1': None, 'kp2': None, 'emb_path': None, 'confidence': 'none'})
+                return
+            results_original = search_compact_index(query_desc=query_megaloc_desc, center=center, radius_km=radius, top_k=100)
+            results_flipped = search_compact_index(query_desc=desc_flipped, center=center, radius_km=radius, top_k=100)
             
             # Merge and deduplicate by panoid, keep higher score
             seen = {}
@@ -1915,7 +2524,7 @@ class StreetViewMatcherGUI:
                 return
 
             if True: # MASt3R is now the default and only Stage 2
-                MAST3R_STAGE2_TOP_N = 500
+                MAST3R_STAGE2_TOP_N = 100
                 candidates_to_check = compact_results[:MAST3R_STAGE2_TOP_N]
                 q.put(('status', f"Stage 2: Running MASt3R directly on top {len(candidates_to_check)} candidates..."))
                 
@@ -1926,6 +2535,30 @@ class StreetViewMatcherGUI:
                 try:
                     mast3r = get_lazy_mast3r()
                     if mast3r is not None:
+                        # Prefetch upcoming candidates' tiles in the background
+                        # while MASt3R matches the current one, instead of
+                        # blocking on a fresh download for every candidate in
+                        # sequence. Bounded lookahead (not the whole batch)
+                        # because best['inliers'] >= 450 can break out of
+                        # this loop early -- downloading all 100 candidates
+                        # up front would waste bandwidth on ones the early
+                        # exit ends up skipping.
+                        PREFETCH_LOOKAHEAD = 4
+                        prefetch_pool = concurrent.futures.ThreadPoolExecutor(max_workers=PREFETCH_LOOKAHEAD)
+                        prefetch_futures = {}
+
+                        def _fetch_pano_tiles(cand):
+                            cpid = cand.get('panoid')
+                            if not cpid:
+                                return None
+                            try:
+                                return download_tiles(tiles_info(cpid), max_workers=16)
+                            except Exception:
+                                return None
+
+                        for j in range(min(PREFETCH_LOOKAHEAD, len(candidates_to_check))):
+                            prefetch_futures[j] = prefetch_pool.submit(_fetch_pano_tiles, candidates_to_check[j])
+
                         for i, match in enumerate(candidates_to_check):
                             if self.cancel_search.is_set():
                                 q.put(('status', "Search cancelled."))
@@ -1935,11 +2568,19 @@ class StreetViewMatcherGUI:
                             pid = match.get('panoid')
                             hdg = match.get('heading')
                             if not pid or hdg is None: continue
-                            
+
+                            # Keep the lookahead window full: queue the next
+                            # not-yet-queued candidate now that we're
+                            # consuming this one.
+                            next_to_queue = i + PREFETCH_LOOKAHEAD
+                            if next_to_queue < len(candidates_to_check) and next_to_queue not in prefetch_futures:
+                                prefetch_futures[next_to_queue] = prefetch_pool.submit(
+                                    _fetch_pano_tiles, candidates_to_check[next_to_queue])
+
                             pano_img = None
                             try:
-                                tiles = tiles_info(pid)
-                                td = download_tiles(tiles, max_workers=16)
+                                fut = prefetch_futures.pop(i, None)
+                                td = fut.result() if fut is not None else download_tiles(tiles_info(pid), max_workers=16)
                                 if td:
                                     pano_img = stitch_tiles(td)
                                     maxw = 2048
@@ -1984,7 +2625,12 @@ class StreetViewMatcherGUI:
                                 if best['inliers'] >= 450: # Slightly higher early exit with consensus
                                     q.put(('status', f"Ultra-Strong MASt3R match! {best['inliers']} points — stopping early"))
                                     break
-                        
+
+                        # Stop prefetching -- cancel any in-flight lookahead
+                        # downloads for candidates we no longer need (early
+                        # exit, cancel, or just finished the batch).
+                        prefetch_pool.shutdown(wait=False, cancel_futures=True)
+
                         # ── NEW: Rank Top 5 Geographic Clusters for Sidebar ──
                         if len(all_mast3r_matches) >= 3:
                             CELL_SIZE = 0.00045 # ~50m
@@ -2049,7 +2695,7 @@ class StreetViewMatcherGUI:
         locations = set()
 
         # Load only metadata for coverage (skip descriptors entirely)
-        if os.path.exists(COMPACT_META_PATH):
+        if has_active_index() and os.path.exists(COMPACT_META_PATH):
             try:
                 meta = np.load(COMPACT_META_PATH, allow_pickle=True)
                 lats = meta['lats']
@@ -2113,23 +2759,30 @@ class StreetViewMatcherGUI:
                         marker_color_circle="#3b82f6", marker_color_outside="#1e3a8a")
                     self.coverage_markers.append(marker)
 
-            self._set_status(f"Coverage: {len(locations)} points, {line_count} segments.")
+            status_msg = f"Coverage: {len(locations)} points, {line_count} segments."
         else:
             if self.search_nets:
                 self.map_widget.set_position(self.search_nets[0][0], self.search_nets[0][1])
             else:
                 self.map_widget.set_position(self.lat_var.get(), self.lon_var.get())
             self.map_widget.set_zoom(14)
-            self._set_status("No index found — only showing search area(s).")
+            status_msg = "No index found — only showing search area(s)."
 
-        # Draw yellow search circles
+        # Draw yellow search circles -- these mark the area(s) from your
+        # MOST RECENT search (self.search_nets), NOT the current index's
+        # coverage. They're independent: self.search_nets only updates when
+        # you actually run a search, so switching indexes without searching
+        # again leaves an old, unrelated circle on the map. Note that in the
+        # status text so it doesn't read as "this is where the index is."
         if self.search_nets:
             for net in self.search_nets:
                 net_lat, net_lon, net_radius = net[0], net[1], net[2]
                 circle_points = generate_circle_points(net_lat, net_lon, net_radius)
                 poly = self.map_widget.set_polygon(circle_points, outline_color="yellow", border_width=6, fill_color="")
                 self.result_elements.append(poly)
+            status_msg += " (Yellow = your last search area, not the index's coverage.)"
 
+        self._set_status(status_msg)
         self.master.update_idletasks()
 
     
@@ -2462,6 +3115,17 @@ class StreetViewMatcherGUI:
         repo_id = idx.get('repo_id', '')
         name = idx.get('name', 'Unknown')
 
+        # Refuse to re-download an index already present locally. Older
+        # bundles predate index_id and won't have one -- for those we can't
+        # be sure, so we don't block (better a rare duplicate than blocking
+        # a legitimate download).
+        remote_id = idx.get('index_id')
+        if remote_id:
+            local_ids = {m.get('index_id') for m in scan_indexes()}
+            if remote_id in local_ids:
+                self._hub_status.config(text=f"'{name}' is already downloaded.")
+                return
+
         # A downloaded index must land in its own encoder's directory. Switch the
         # active encoder to match the index type before downloading.
         target_enc = idx.get('encoder') or ('mixvpr' if 'MixVPR' in str(idx.get('descriptor_model', '')) else 'megaloc')
@@ -2473,7 +3137,7 @@ class StreetViewMatcherGUI:
             except Exception as e:
                 self._hub_status.config(text=f"Cannot use {target_enc} index: {e}")
                 return
-        dest_dir = COMPACT_INDEX_DIR
+        dest_dir = DATA_DIR  # download() appends indexes/{index_id} itself
 
         self._hub_status.config(text=f"Downloading {name} ({target_enc.upper()})...")
         hub_win.update_idletasks()
@@ -2487,17 +3151,23 @@ class StreetViewMatcherGUI:
                 )
 
                 global _compact_cache
+                loaded_manifest = None
+                if manifest and manifest.get("index_id"):
+                    loaded_manifest = load_index(manifest["index_id"])
                 _compact_cache = None
 
                 def on_done():
                     self._hub_status.config(text=f"✅ Downloaded {name}! Ready to search.")
                     self._set_status(f"Index loaded: {name}")
-                    if manifest:
-                        self.lat_var.set(manifest.get('center_lat', self.lat_var.get()))
-                        self.lon_var.set(manifest.get('center_lon', self.lon_var.get()))
-                        self.radius_var.set(manifest.get('radius_km', self.radius_var.get()))
-                        self.map_widget.set_position(manifest['center_lat'], manifest['center_lon'])
-                        self.map_widget.set_zoom(13)
+                    if loaded_manifest:
+                        cov = loaded_manifest.get("coverage_center", {})
+                        if cov.get("lat") is not None and cov.get("lon") is not None:
+                            self.lat_var.set(cov["lat"])
+                            self.lon_var.set(cov["lon"])
+                            self.map_widget.set_position(cov["lat"], cov["lon"])
+                            self.map_widget.set_zoom(13)
+                        if loaded_manifest.get("radius_km") is not None:
+                            self.radius_var.set(loaded_manifest["radius_km"])
 
                 self.master.after(0, on_done)
             except Exception as e:
@@ -2507,7 +3177,7 @@ class StreetViewMatcherGUI:
         threading.Thread(target=do_download, daemon=True).start()
 
     def _hub_upload(self, hub_win):
-        if not os.path.exists(COMPACT_DESCS_PATH):
+        if not has_active_index() or not os.path.exists(COMPACT_DESCS_PATH):
             self._hub_status.config(text="No index to upload. Create one first.")
             return
 
@@ -2560,7 +3230,7 @@ class StreetViewMatcherGUI:
                 try:
                     token = self.hf_token_var.get().strip()
                     if not token:
-                        self.master.after(0, lambda: messagebox.showerror("Hugging Face Help", 
+                        self.master.after(0, lambda: tk.messagebox.showerror("Hugging Face Help", 
                             "Please connect Hugging Face to upload.\n\n"
                             "1. Click 'Get Hugging Face Token'\n"
                             "2. Generate a WRITE token\n"
@@ -2596,7 +3266,7 @@ class StreetViewMatcherGUI:
         self.final_up_btn.pack(pady=(10, 20))
 
     def export_index(self):
-        if not os.path.exists(COMPACT_DESCS_PATH):
+        if not has_active_index() or not os.path.exists(COMPACT_DESCS_PATH):
             self._set_status("No index to export. Create one first.")
             return
 
@@ -2644,18 +3314,34 @@ class StreetViewMatcherGUI:
 
         def do_import():
             try:
+                import zipfile
+                # Peek at the bundle's manifest before extracting, so we can
+                # refuse a re-import without ever touching disk.
+                with zipfile.ZipFile(file_path, 'r') as zf:
+                    peek_manifest = json.loads(zf.read("manifest.json"))
+                bundle_id = peek_manifest.get("index_id")
+                if bundle_id:
+                    local_ids = {m.get('index_id') for m in scan_indexes()}
+                    if bundle_id in local_ids:
+                        self.master.after(0, lambda: self._set_status(
+                            f"'{peek_manifest.get('name', bundle_id)}' is already imported."))
+                        return
+
                 from netryx_hub import extract_bundle
-                manifest = extract_bundle(file_path, COMPACT_INDEX_DIR)
+                # extract_bundle wants the BASE data dir -- it appends
+                # indexes/{uuid} itself and writes manifest.json there.
+                manifest = extract_bundle(file_path, DATA_DIR)
 
                 global _compact_cache
+                imported_id = manifest["index_id"]
+                load_index(imported_id)  # repoints all COMPACT_* globals
                 _compact_cache = None
 
-                # Load PCA if present
-                pca_path = os.path.join(COMPACT_INDEX_DIR, "megaloc_pca.pkl")
-                if os.path.exists(pca_path):
+                # Load PCA if present (load_index already set COMPACT_PCA_PATH)
+                if ENCODER_USES_PCA and COMPACT_PCA_PATH and os.path.exists(COMPACT_PCA_PATH):
                     try:
                         from megaloc_utils import load_pca
-                        load_pca(pca_path)
+                        load_pca(COMPACT_PCA_PATH)
                     except Exception:
                         pass
 
@@ -2732,7 +3418,7 @@ class StreetViewMatcherGUI:
 
             ("Search Parameters and Calibration", 
              "For the best results, you should fine-tune your search based on the city's density:\n\n"
-             "• Grid Resolution: This is the gap between scan points. For broad coverage and general mapping, a 300-meter resolution is highly recommended. For extreme precision in dense urban areas, you can use 25-50 meters.\n\n"
+             "• Grid Resolution: This is the gap between scan points, in meters. For broad coverage and general mapping, a 300-meter resolution is highly recommended. For extreme precision in dense urban areas, you can use 25-50 meters (note: values below ~43m are floored, since Street View's own search radius per point already covers that tightly).\n\n"
              "• Match Threshold: This controls how picky the Stage 1 retrieval is. A higher threshold (0.80+) is faster but might miss subtle matches. Lowering it (0.60) can help in difficult conditions like light or weather changes."),
 
             ("Practical Tips for Researchers", 
@@ -2785,9 +3471,17 @@ class StreetViewMatcherGUI:
 # start the app here god please fucking work i wanna kms
 
 if __name__ == "__main__":
-    # Ensure data dirs exist
-    for d in [DATA_DIR, MEGALOC_PARTS_DIR, COMPACT_INDEX_DIR]:
+    # Ensure data dirs exist. COMPACT_INDEX_DIR is intentionally excluded --
+    # it's None until an index is built or loaded via load_index().
+    for d in [DATA_DIR, MEGALOC_PARTS_DIR, INDEXES_DIR]:
         os.makedirs(d, exist_ok=True)
+
+    available = scan_indexes()
+    print(f"[INDEX] Found {len(available)} index(es): "
+          f"{[m.get('name', m.get('index_id')) for m in available]}")
+    if available:
+        # Auto-load the most recently built index so the app opens usable.
+        load_index(available[-1]["index_id"])
 
     root = tk.Tk()
     app = StreetViewMatcherGUI(root)

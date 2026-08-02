@@ -43,7 +43,7 @@ import hashlib
 import zipfile
 import tempfile
 import shutil
-import time
+import time, uuid
 import numpy as np
 from pathlib import Path
 
@@ -158,6 +158,7 @@ def create_bundle(index_dir, output_path, name, description, center_lat, center_
     # Build manifest
     manifest = {
         "format_version": BUNDLE_FORMAT_VERSION,
+        "index_id": str(uuid.uuid4()),
         "name": name,
         "description": description,
         "creator": creator,
@@ -169,8 +170,12 @@ def create_bundle(index_dir, output_path, name, description, center_lat, center_
         "num_panoids": int(num_panoids),
         "descriptor_dim": int(desc_dim),
         "raw_descriptor_dim": 8448,
-        "descriptor_model": "MegaLoc",
-        "pca_components": int(desc_dim),
+        "descriptor_model": "MegaLoc" if os.path.exists(
+            os.path.join(index_dir, "megaloc_descriptors.npy")
+        ) else "MixVPR",
+        "pca_components": int(desc_dim) if os.path.exists(
+            os.path.join(index_dir, "megaloc_pca.pkl")
+        ) else None,
         "heading_step_deg": int(heading_step),
         "crop_fov_deg": int(crop_fov),
         "crop_size_px": int(crop_size),
@@ -243,19 +248,31 @@ def extract_bundle(bundle_path, index_dir):
     Returns:
         manifest dict
     """
-    os.makedirs(index_dir, exist_ok=True)
 
     with zipfile.ZipFile(bundle_path, 'r') as zf:
         # Read manifest first
         manifest = json.loads(zf.read("manifest.json"))
+        # Use manifest UUID if available, otherwise create one for old bundles
+        index_id = manifest.get("index_id", str(uuid.uuid4()))
+
+        index_dir = os.path.join(index_dir, "indexes", index_id)
+        os.makedirs(index_dir, exist_ok=True)
+
+        manifest["index_id"] = index_id
         print(f"[HUB] Extracting: {manifest['name']}")
         print(f"[HUB]   Coverage: ({manifest['center_lat']:.4f}, {manifest['center_lon']:.4f}) "
               f"r={manifest['radius_km']}km")
         print(f"[HUB]   Entries: {manifest['num_entries']}, dim: {manifest['descriptor_dim']}")
 
         # Extract with correct filenames for Netryx
+        # Choose descriptor filename based on encoder
+        if manifest.get("descriptor_model", "").lower() == "mixvpr":
+            descriptor_name = "mixvpr_descriptors.npy"
+        else:
+            descriptor_name = "megaloc_descriptors.npy"
+
         file_mapping = {
-            "descriptors.npy": "megaloc_descriptors.npy",
+            "descriptors.npy": descriptor_name,
             "metadata.npz": "metadata.npz",
             "pca_model.pkl": "megaloc_pca.pkl",
             "index_info.txt": "index_info.txt",
@@ -313,8 +330,9 @@ Pre-computed MegaLoc index for **Netryx Drishti** geolocation.
 from netryx_hub import NetryxHub
 
 hub = NetryxHub()
-hub.download("{manifest['name'].lower().replace(' ', '-')}", output_dir="./netryx_data/index")
-# Now open Netryx and search!
+hub.download("{manifest['name'].lower().replace(' ', '-')}", output_dir="./netryx_data")
+# The index is registered under netryx_data/indexes/{{uuid}}/ -- it'll show
+# up in Netryx's index list automatically. Select it there to search.
 ```
 
 Or download manually and use **Import Index** in the Netryx GUI.
@@ -458,15 +476,17 @@ class NetryxHub:
 
     def download(self, repo_name, output_dir, progress_callback=None):
         """Download an index from the hub and install it.
-        
+
         Args:
             repo_name: Either full repo ID ("netryx-community/moscow-10km")
                        or just the short name ("moscow-10km")
-            output_dir: Netryx COMPACT_INDEX_DIR to install into
+            output_dir: Netryx DATA_DIR (base dir) -- extract_bundle appends
+                        indexes/{uuid} itself.
             progress_callback: fn(message) for status updates
-            
+
         Returns:
-            manifest dict
+            manifest dict (includes index_id -- pass to load_index() after
+            this returns to actually activate the downloaded index)
         """
         # Normalize repo ID
         if "/" not in repo_name:
@@ -499,17 +519,8 @@ class NetryxHub:
         if progress_callback:
             progress_callback("Extracting index...")
 
-        # Extract bundle
+        # Extract bundle (nests under output_dir/indexes/{index_id}/)
         manifest = extract_bundle(bundle_path, output_dir)
-
-        # Load PCA model if present
-        pca_path = os.path.join(output_dir, "megaloc_pca.pkl")
-        if os.path.exists(pca_path):
-            try:
-                from megaloc_utils import load_pca
-                load_pca(pca_path)
-            except Exception:
-                pass
 
         if progress_callback:
             progress_callback(f"Index ready: {manifest['name']}")
@@ -517,18 +528,38 @@ class NetryxHub:
         return manifest
 
     def _download_individual(self, repo_id, output_dir, progress_callback=None):
-        """Download index files individually (fallback if no bundle)."""
-        os.makedirs(output_dir, exist_ok=True)
+        """Download index files individually (fallback if no bundle).
 
+        output_dir: Netryx DATA_DIR (base dir) -- files land under
+        output_dir/indexes/{index_id}/, matching extract_bundle's layout.
+        """
+        # Need the manifest first to know the index_id, so fetch it before
+        # anything else.
+        try:
+            manifest_tmp = hf_hub_download(
+                repo_id=repo_id, filename="manifest.json", repo_type="dataset",
+            )
+            with open(manifest_tmp) as f:
+                manifest = json.load(f)
+        except Exception as e:
+            print(f"[HUB]   Could not fetch manifest.json: {e}")
+            return None
+
+        index_id = manifest.get("index_id", str(uuid.uuid4()))
+        manifest["index_id"] = index_id
+        index_dir = os.path.join(output_dir, "indexes", index_id)
+        os.makedirs(index_dir, exist_ok=True)
+
+        descriptor_name = ("mixvpr_descriptors.npy"
+                            if manifest.get("descriptor_model", "").lower() == "mixvpr"
+                            else "megaloc_descriptors.npy")
         file_mapping = {
-            "descriptors.npy": "megaloc_descriptors.npy",
+            "descriptors.npy": descriptor_name,
             "metadata.npz": "metadata.npz",
             "pca_model.pkl": "megaloc_pca.pkl",
-            "manifest.json": "manifest.json",
             "index_info.txt": "index_info.txt",
         }
 
-        manifest = None
         for src_name, dst_name in file_mapping.items():
             try:
                 downloaded = hf_hub_download(
@@ -536,17 +567,19 @@ class NetryxHub:
                     filename=src_name,
                     repo_type="dataset",
                 )
-                dst_path = os.path.join(output_dir, dst_name)
+                dst_path = os.path.join(index_dir, dst_name)
                 shutil.copy2(downloaded, dst_path)
                 print(f"[HUB]   Downloaded {src_name} -> {dst_name}")
-
-                if src_name == "manifest.json":
-                    with open(downloaded) as f:
-                        manifest = json.load(f)
             except Exception as e:
                 print(f"[HUB]   Skipping {src_name}: {e}")
 
-        if manifest and progress_callback:
+        # Write manifest.json last, once every other file is in place --
+        # its presence is what tells scan_indexes()/load_index() the index
+        # is complete and safe to use.
+        with open(os.path.join(index_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        if progress_callback:
             progress_callback(f"Index ready: {manifest.get('name', repo_id)}")
 
         return manifest
