@@ -23,11 +23,11 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 from PIL import Image
+import torch.hub
 
 # ── Locate the VPR-methods repo that ships the MixVPR architecture ──────────
 # (cached by torch.hub the first time any VPR model is fetched)
-_VPR_REPO = os.path.expanduser(
-    "~/.cache/torch/hub/gmberton_VPR-methods-evaluation_master")
+_VPR_REPO = os.path.join(torch.hub.get_dir(), "gmberton_VPR-methods-evaluation_master")
 if os.path.isdir(_VPR_REPO) and _VPR_REPO not in sys.path:
     sys.path.insert(0, _VPR_REPO)
 

@@ -147,7 +147,7 @@ def get_megaloc_model(device=None):
         # ── END MPS FIX ──────────────────────────────────────────────
         with autocast(dev, dtype=torch.bfloat16):
             # use default mode to cut down on compile time
-            _megaloc_model = torch.compile(model) 
+            _megaloc_model = model
 
         print(f"[MEGALOC] Model ready. Output dim: {MEGALOC_RAW_DIM}")
         return _megaloc_model
