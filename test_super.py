@@ -68,6 +68,8 @@ MAX_MATCH_WORKERS = 16
 EARLY_EXIT_INLIER_THRESHOLD = 300
 MEGALOC_BATCH_SIZE = 16 if device == 'cpu' else 64  # smaller batch size on CPU ensures fast inference without RAM/thread contention
 CROP_QUEUE_SIZE = 4096
+PANOID_SEARCH_RADIUS_M = 50
+GRID_SPACING_OVERLAP_FACTOR = 0.85
 
 extractor_lock = threading.Lock()
 
