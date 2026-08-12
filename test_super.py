@@ -529,7 +529,7 @@ async def _download_tiles_multi(panoid_tile_lists, max_workers=120, status_callb
             if data:
                 results[pid][(xr, yr)] = data
             done += 1
-            if status_callback:
+            if status_callback and (done % 50 == 0 or done == total_tiles):
                 status_callback(done, total_tiles)
 
         tasks = [
