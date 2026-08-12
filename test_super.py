@@ -2035,6 +2035,14 @@ class StreetViewMatcherGUI:
         win.protocol("WM_DELETE_WINDOW", finish)
         render()
 
+    def cancel_current_search(self):
+        self._set_status("Operacja anulowana przez użytkownika.")
+        if hasattr(self, 'cancel_btn'):
+            try:
+                self.cancel_btn.pack_forget()
+            except Exception:
+                pass
+
     def _update_mode(self):
         mode = self.mode_var.get()
         if mode == "search":
