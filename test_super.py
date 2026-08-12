@@ -1,5 +1,12 @@
 import os
 import sys
+import warnings
+
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -2262,6 +2269,18 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
 
     print(f"\n{C_MAGENTA}[WEKTORY]{C_RESET} ⚡ Projekcja 3D zakończona! Przeprowadzanie dedukcji neuronowej {ACTIVE_ENCODER.upper()}...")
     crop_queue.put("DONE")
+
+    total_target = max(1, len(panoids) * embeddings_per_panoid)
+    spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spin_idx = 0
+
+    while extractor_thread.is_alive():
+        spinner = spinners[spin_idx % len(spinners)]
+        spin_idx += 1
+        curr = total_extracted
+        update_status(f"{spinner} Wektorowanie AI ({ACTIVE_ENCODER.upper()})", current=curr, total=total_target)
+        time.sleep(0.08)
+
     extractor_thread.join()
 
     print(f"\n{C_GREEN}[WEKTORY]{C_RESET} ✅ Wektorowanie cech zakończone ({total_extracted:,} wycinków). Budowanie skompresowanej bazy...")
