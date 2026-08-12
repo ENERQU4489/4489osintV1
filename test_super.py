@@ -56,7 +56,10 @@ torch._dynamo.config.suppress_errors = True
 #PCA matching dimensions
 INDEX_TARGET_DIM = 1024
 
-# performance tuning
+# Device and model setup
+device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
 # performance tuning
 MAX_PANOID_WORKERS = 128
 MAX_HEADING_WORKERS = 4
@@ -65,26 +68,6 @@ MAX_MATCH_WORKERS = 16
 EARLY_EXIT_INLIER_THRESHOLD = 300
 MEGALOC_BATCH_SIZE = 16 if device == 'cpu' else 64  # smaller batch size on CPU ensures fast inference without RAM/thread contention
 CROP_QUEUE_SIZE = 4096
-
-# Each panoid API call already searches a radius around the query point
-# (the "2d50" param in _panoids_url — 50 meters) and returns every pano
-# Google finds inside it, not just the one nearest the exact coordinate.
-# Grid points closer together than this radius search overlapping circles
-# and mostly rediscover the same panos, which is pure wasted API calls.
-# PANOID_SEARCH_RADIUS_M must match the "2d{N}" value in _panoids_url below
-# -- if you change one, change the other.
-PANOID_SEARCH_RADIUS_M = 50
-# Grid spacing = radius * this factor. <1.0 leaves deliberate overlap so
-# thin strips of coverage (e.g. a road running between two grid points)
-# don't get missed; 1.0 is the "just barely touching" tiling. Don't push
-# above ~1.0 or genuine gaps start opening up between search circles.
-GRID_SPACING_OVERLAP_FACTOR = 0.85
-
-
-#Device and model steup stuff
-
-device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
 
 extractor_lock = threading.Lock()
 
