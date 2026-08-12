@@ -2072,208 +2072,199 @@ class StreetViewMatcherGUI:
 
     # make emdbedings for the grid
 
-    def _create_embeddings(self, center, radius, res, crop_fov, crop_size, crop_step):
-        q = self.match_queue
-        q.put(('status', "Getting grid points..."))
-        points = grid_points(center, radius, res)
-        # scan for nodes
-        q.put(('status', f"Generated {len(points)} grid points. Downloading scan nodes..."))
+def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop_step=90, status_cb=None):
+    def update_status(msg, current=None, total=None):
+        if status_cb:
+            status_cb(msg, current, total)
 
-        panoids = get_panoids(
-            points,
-            status_callback=lambda idx, total: q.put(('status', f"Scan node fetch {idx}/{total}...")),
-            max_workers=MAX_PANOID_WORKERS
-        )
-        q.put(('status', f"Found {len(panoids)} scan nodes. Extracting EigenPlace features..."))
+    update_status("Pobieranie siatki punktów...")
+    points = grid_points(center, radius, res)
+    update_status(f"Wygenerowano {len(points)} punktów siatki. Skanowanie panoram...")
 
-        headings_all = sorted(list(set(((h // crop_step) * crop_step) % 360 for h in range(0, 360, crop_step))))
-        embeddings_per_panoid = len(headings_all)
+    def panoid_status(idx, total):
+        update_status(f"Skan panoram {idx}/{total}", current=idx, total=total)
 
-        os.makedirs(MEGALOC_PARTS_DIR, exist_ok=True)
+    panoids = get_panoids(
+        points,
+        status_callback=panoid_status,
+        max_workers=MAX_PANOID_WORKERS
+    )
+    update_status(f"Wykryto {len(panoids)} panoram. Ekstrakcja cech ({ACTIVE_ENCODER.upper()})...")
 
-        # Load existing embeddings for skip logic (from part files, not CSV — crash-safe)
-        existing_files = set()
-        try:
-            existing_parts = glob.glob(os.path.join(MEGALOC_PARTS_DIR, "megaloc_part_*.npz"))
-            for ep in existing_parts:
-                data = np.load(ep, allow_pickle=True)
-                for p in data['paths']:
-                    existing_files.add(os.path.basename(str(p)))
-                del data
-            if existing_files:
-                q.put(('status', f"Loaded {len(existing_files)} existing entries from part files. Starting..."))
-        except Exception as e:
-            q.put(('status', f"Warning: Could not load existing parts: {e}"))
+    headings_all = sorted(list(set(((h // crop_step) * crop_step) % 360 for h in range(0, 360, crop_step))))
+    embeddings_per_panoid = len(headings_all)
 
-        crop_queue = queue.Queue(maxsize=CROP_QUEUE_SIZE)
-        tracker = ProgressTracker(len(panoids), estimate_storage=True,
-                                 embeddings_per_item=embeddings_per_panoid, avg_bytes_per_embedding=2560)
-        total_extracted = 0
+    os.makedirs(MEGALOC_PARTS_DIR, exist_ok=True)
 
-        # thread to extract features in batch
-        def batch_extractor():
-            nonlocal total_extracted
-            target_batch_size = MEGALOC_BATCH_SIZE
-            batch_buffer = []
-            megaloc_buffer_descs = []
-            megaloc_buffer_paths = []
-            megaloc_buffer_lats = []
-            megaloc_buffer_lons = []
+    existing_files = set()
+    try:
+        existing_parts = glob.glob(os.path.join(MEGALOC_PARTS_DIR, "megaloc_part_*.npz"))
+        for ep in existing_parts:
+            data = np.load(ep, allow_pickle=True)
+            for p in data['paths']:
+                existing_files.add(os.path.basename(str(p)))
+            del data
+        if existing_files:
+            update_status(f"Załadowano {len(existing_files)} istniejących punktów z pamięci podręcznej.")
+    except Exception as e:
+        update_status(f"Ostrzeżenie: Nie można załadować pamięci podręcznej: {e}")
 
-            def save_megaloc_chunk():
-                if not megaloc_buffer_descs:
-                    return
-                try:
-                    timestamp = int(time.time() * 1000)
-                    part_filename = os.path.join(MEGALOC_PARTS_DIR, f"megaloc_part_{timestamp}.npz")
-                    all_descs = np.vstack(megaloc_buffer_descs)
-                    # uncompressed savez: float32 descriptors barely compress, and
-                    # np.load reads both formats identically
-                    np.savez(
-                        part_filename,
-                        descriptors=all_descs,
-                        paths=np.array(megaloc_buffer_paths, dtype=object),
-                        lats=np.array(megaloc_buffer_lats, dtype=np.float32),
-                        lons=np.array(megaloc_buffer_lons, dtype=np.float32),
-                    )
-                    q.put(('status', f"Saved index chunk: {len(megaloc_buffer_paths)} items"))
-                    megaloc_buffer_descs.clear()
-                    megaloc_buffer_paths.clear()
-                    megaloc_buffer_lats.clear()
-                    megaloc_buffer_lons.clear()
-                except Exception as e:
-                    print(f"Error saving EigenPlace chunk: {e}")
+    crop_queue = queue.Queue(maxsize=CROP_QUEUE_SIZE)
+    tracker = ProgressTracker(len(panoids), estimate_storage=True,
+                             embeddings_per_item=embeddings_per_panoid, avg_bytes_per_embedding=2560)
+    total_extracted = 0
 
-            def process_batch(buffer):
-                nonlocal total_extracted
-                crops = [b[0] for b in buffer]
-                meta = [b[1] for b in buffer]
-                try:
-                    total_extracted += len(meta)
+    def batch_extractor():
+        nonlocal total_extracted
+        target_batch_size = MEGALOC_BATCH_SIZE
+        batch_buffer = []
+        megaloc_buffer_descs = []
+        megaloc_buffer_paths = []
+        megaloc_buffer_lats = []
+        megaloc_buffer_lons = []
 
-                    crops_pil = [tensor_to_pil(c) for c in crops]
-                    cos_descs = batch_encode(crops_pil, batch_size=len(crops))
-                    megaloc_buffer_descs.append(cos_descs)
-                    megaloc_buffer_paths.extend([m['path'] for m in meta])
-                    megaloc_buffer_lats.extend([m['lat'] for m in meta])
-                    megaloc_buffer_lons.extend([m['lon'] for m in meta])
-
-                    if len(megaloc_buffer_paths) >= 5000:
-                        save_megaloc_chunk()
-                except Exception as e:
-                    print(f"Batch processing error: {e}")
-
-            while True:
-                item = crop_queue.get()
-                if item == "DONE":
-                    if batch_buffer:
-                        process_batch(batch_buffer)
-                    save_megaloc_chunk()
-                    crop_queue.task_done()
-                    break
-                batch_buffer.append(item)
-                if len(batch_buffer) >= target_batch_size:
-                    process_batch(batch_buffer)
-                    batch_buffer = []
-                crop_queue.task_done()
-
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-            gc.collect()
-
-        extractor_thread = threading.Thread(target=batch_extractor)
-        extractor_thread.start()
-
-        base_dirs = get_projection_base_dirs(crop_fov, (crop_size, crop_size))
-
-        # Figure out which panoids actually need downloading BEFORE touching
-        # the network at all -- previously this skip check happened inside
-        # process_one_panoid, so already-indexed panoids still paid for a
-        # ThreadPoolExecutor slot even though they did nothing.
-        panoids_needing_download = []
-        missing_yaws_by_id = {}
-        for panoid in panoids:
-            panoid_id = panoid['panoid']
-            missing = [y for y in headings_all if f"{panoid_id}_{y}.npz" not in existing_files]
-            if missing:
-                panoids_needing_download.append(panoid)
-                missing_yaws_by_id[panoid_id] = missing
-
-        skipped = len(panoids) - len(panoids_needing_download)
-
-        # Download tiles for ALL panoids that need them in ONE shared event
-        # loop / connection pool, instead of one asyncio.run() per panoid.
-        # Spinning up a fresh event loop per panoid inside an already-
-        # concurrent ThreadPoolExecutor (up to MAX_PANOID_WORKERS at once,
-        # each opening its own MAX_DOWNLOAD_WORKERS-sized pool for just 8
-        # tiles) was the actual bottleneck in this stage.
-        all_tiles_data = {}
-        if panoids_needing_download:
-            def _dl_progress(done, total):
-                q.put(('status', f"Downloading tiles: {done}/{total}..."))
-
-            all_tiles_data = download_tiles_for_panoids(
-                [p['panoid'] for p in panoids_needing_download],
-                max_workers=MAX_DOWNLOAD_WORKERS,
-                status_callback=_dl_progress,
-            )
-
-        def process_one_panoid(panoid):
-            panoid_id = panoid['panoid']
-            missing_yaws = missing_yaws_by_id.get(panoid_id)
-            if not missing_yaws:
-                return True
-
-            tiles_data = all_tiles_data.get(panoid_id)
-            if not tiles_data:
-                return False
+        def save_megaloc_chunk():
+            if not megaloc_buffer_descs:
+                return
             try:
-                pano_img = stitch_tiles(tiles_data)
-            except Exception:
-                return False
-            maxw = 2048
-            if pano_img.size[0] > maxw:
-                pano_img = pano_img.resize((maxw, int(pano_img.size[1] * (maxw / pano_img.size[0]))), Image.BILINEAR)
+                timestamp = int(time.time() * 1000)
+                part_filename = os.path.join(MEGALOC_PARTS_DIR, f"megaloc_part_{timestamp}.npz")
+                all_descs = np.vstack(megaloc_buffer_descs)
+                np.savez(
+                    part_filename,
+                    descriptors=all_descs,
+                    paths=np.array(megaloc_buffer_paths, dtype=object),
+                    lats=np.array(megaloc_buffer_lats, dtype=np.float32),
+                    lons=np.array(megaloc_buffer_lons, dtype=np.float32),
+                )
+                update_status(f"Zapisano pakiet danych: {len(megaloc_buffer_paths)} wycinków")
+                megaloc_buffer_descs.clear()
+                megaloc_buffer_paths.clear()
+                megaloc_buffer_lats.clear()
+                megaloc_buffer_lons.clear()
+            except Exception as e:
+                print(f"Błąd zapisu pakietu danych: {e}")
 
-            pano_t = pil_to_tensor(pano_img)
+        def process_batch(buffer):
+            nonlocal total_extracted
+            crops = [b[0] for b in buffer]
+            meta = [b[1] for b in buffer]
+            try:
+                total_extracted += len(meta)
+                crops_pil = [tensor_to_pil(c) for c in crops]
+                cos_descs = batch_encode(crops_pil, batch_size=len(crops))
+                megaloc_buffer_descs.append(cos_descs)
+                megaloc_buffer_paths.extend([m['path'] for m in meta])
+                megaloc_buffer_lats.extend([m['lat'] for m in meta])
+                megaloc_buffer_lons.extend([m['lon'] for m in meta])
 
-            crops_batch = equirectangular_to_rectilinear_torch(
-                pano_t, fov_deg=crop_fov, out_hw=(crop_size, crop_size),
-                yaw_deg=missing_yaws, pitch_deg=0, base_dirs=base_dirs
-            )
-            for i, yaw in enumerate(missing_yaws):
-                crop_t = crops_batch[i].unsqueeze(0)
-                emb_path = f"{panoid_id}_{yaw}.npz"
-                meta = {'path': emb_path, 'lat': panoid['lat'], 'lon': panoid['lon'], 'yaw': yaw}
-                crop_queue.put((crop_t, meta))
+                if len(megaloc_buffer_paths) >= 5000:
+                    save_megaloc_chunk()
+            except Exception as e:
+                print(f"Błąd przetwarzania pakietu: {e}")
 
-            pano_img.close()
-            del pano_t
+        while True:
+            item = crop_queue.get()
+            if item == "DONE":
+                if batch_buffer:
+                    process_batch(batch_buffer)
+                save_megaloc_chunk()
+                crop_queue.task_done()
+                break
+            batch_buffer.append(item)
+            if len(batch_buffer) >= target_batch_size:
+                process_batch(batch_buffer)
+                batch_buffer = []
+            crop_queue.task_done()
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        gc.collect()
+
+    extractor_thread = threading.Thread(target=batch_extractor)
+    extractor_thread.start()
+
+    base_dirs = get_projection_base_dirs(crop_fov, (crop_size, crop_size))
+
+    panoids_needing_download = []
+    missing_yaws_by_id = {}
+    for panoid in panoids:
+        panoid_id = panoid['panoid']
+        missing = [y for y in headings_all if f"{panoid_id}_{y}.npz" not in existing_files]
+        if missing:
+            panoids_needing_download.append(panoid)
+            missing_yaws_by_id[panoid_id] = missing
+
+    skipped = len(panoids) - len(panoids_needing_download)
+
+    all_tiles_data = {}
+    if panoids_needing_download:
+        def _dl_progress(done, total):
+            update_status(f"Pobieranie kafelków panoram: {done}/{total}...", current=done, total=total)
+
+        all_tiles_data = download_tiles_for_panoids(
+            [p['panoid'] for p in panoids_needing_download],
+            max_workers=MAX_DOWNLOAD_WORKERS,
+            status_callback=_dl_progress,
+        )
+
+    def process_one_panoid(panoid):
+        panoid_id = panoid['panoid']
+        missing_yaws = missing_yaws_by_id.get(panoid_id)
+        if not missing_yaws:
             return True
 
-        # Stitching + equirectangular projection is CPU-bound (numpy/torch,
-        # no network waiting), so a thread pool is the right tool here --
-        # the network I/O already happened above in the shared async batch.
-        tracker.update(skipped)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PANOID_WORKERS) as executor:
-            for idx, _ in enumerate(executor.map(process_one_panoid, panoids_needing_download), skipped + 1):
-                tracker.update(idx)
-                q.put(('status', f"Stitching & projecting: {tracker.get_status()}"))
+        tiles_data = all_tiles_data.get(panoid_id)
+        if not tiles_data:
+            return False
+        try:
+            pano_img = stitch_tiles(tiles_data)
+        except Exception:
+            return False
+        maxw = 2048
+        if pano_img.size[0] > maxw:
+            pano_img = pano_img.resize((maxw, int(pano_img.size[1] * (maxw / pano_img.size[0]))), Image.BILINEAR)
 
-        crop_queue.put("DONE")
-        extractor_thread.join()
+        pano_t = pil_to_tensor(pano_img)
 
-        # PCA is fitted inside build_compact_index() on a 100k subsample —
-        # fitting here on ALL raw descriptors loads every part file into RAM
-        # at once and OOMs on large indexes, and its result was overwritten
-        # by build_compact_index()'s own fit anyway.
-        q.put(('status', f"All embeddings saved ({total_extracted} new). Building index (fits PCA)..."))
+        crops_batch = equirectangular_to_rectilinear_torch(
+            pano_t, fov_deg=crop_fov, out_hw=(crop_size, crop_size),
+            yaw_deg=missing_yaws, pitch_deg=0, base_dirs=base_dirs
+        )
+        for i, yaw in enumerate(missing_yaws):
+            crop_t = crops_batch[i].unsqueeze(0)
+            emb_path = f"{panoid_id}_{yaw}.npz"
+            meta = {'path': emb_path, 'lat': panoid['lat'], 'lon': panoid['lon'], 'yaw': yaw}
+            crop_queue.put((crop_t, meta))
 
-        build_compact_index()
-        q.put(('status', f"Done! Index ready. {total_extracted} new entries added."))
+        pano_img.close()
+        del pano_t
+        return True
 
-        global _compact_cache
-        _compact_cache = None
+    tracker.update(skipped)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PANOID_WORKERS) as executor:
+        for idx, _ in enumerate(executor.map(process_one_panoid, panoids_needing_download), skipped + 1):
+            tracker.update(idx)
+            update_status(f"Łączenie & Projekcja 3D: {tracker.get_status()}", current=idx, total=len(panoids))
+
+    crop_queue.put("DONE")
+    extractor_thread.join()
+
+    update_status(f"Zapisano wektory ({total_extracted} nowych). Budowanie skompresowanej bazy...")
+
+    success = build_compact_index()
+    update_status(f"Gotowe! Baza danych została zbudowana ({total_extracted} nowych wpisów).")
+    global _compact_cache
+    _compact_cache = None
+    return success
+
+    def _create_embeddings(self, center, radius, res, crop_fov, crop_size, crop_step):
+        q = self.match_queue
+        def gui_cb(msg, curr=None, tot=None):
+            q.put(('status', msg))
+            if curr is not None and tot is not None and tot > 0:
+                q.put(('progress', curr, tot))
+        process_index_creation(center, radius, res, crop_fov, crop_size, crop_step, status_cb=gui_cb)
 
     # use gemni to guess where we are
 
@@ -3601,16 +3592,26 @@ def run_cli():
     elif args.command == "index":
         set_encoder(args.encoder)
         print(f"[INDEKS] Budowanie nowej bazy wokół ({args.lat:.4f}, {args.lon:.4f}) r={args.radius}km res={args.res}m [{ACTIVE_ENCODER.upper()}]")
-        
-        pts = grid_points((args.lat, args.lon), args.radius, args.res)
-        print(f"[INDEKS] Wygenerowano {len(pts)} punktów siatki. Pobieranie identyfikatorów panoram...")
-        
-        panoids = get_panoids(pts, status_callback=lambda idx, tot: cli_progress_bar(idx, tot, prefix="Skan Panoram"), max_workers=MAX_PANOID_WORKERS)
-        print(f"[INDEKS] Wykryto {len(panoids)} panoram.")
 
-        print("[INDEKS] Przetwarzanie wycinków & budowanie skompresowanej bazy danych...")
-        build_compact_index()
-        print("[INDEKS] Tworzenie bazy zakończone pomyślnie!")
+        def cli_cb(msg, curr=None, tot=None):
+            if curr is not None and tot is not None and tot > 0:
+                cli_progress_bar(curr, tot, prefix="Postęp Indeksowania", suffix=msg)
+            else:
+                print(f"[INDEKS] {msg}")
+
+        success = process_index_creation(
+            center=(args.lat, args.lon),
+            radius=args.radius,
+            res=args.res,
+            crop_fov=args.fov,
+            crop_size=args.size,
+            crop_step=args.step,
+            status_cb=cli_cb
+        )
+        if success:
+            print("[INDEKS] Tworzenie bazy zakończone pomyślnie!")
+        else:
+            print("[INDEKS] Wystąpił błąd podczas tworzenia bazy danych.")
 
     elif args.command == "match":
         if not MAST3R_AVAILABLE:
