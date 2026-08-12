@@ -63,8 +63,8 @@ MAX_HEADING_WORKERS = 4
 MAX_DOWNLOAD_WORKERS = 120
 MAX_MATCH_WORKERS = 16
 EARLY_EXIT_INLIER_THRESHOLD = 300
-MEGALOC_BATCH_SIZE = 64  # descriptors are identical at any batch size; larger = better GPU utilization
-CROP_QUEUE_SIZE =  1024
+MEGALOC_BATCH_SIZE = 16 if device == 'cpu' else 64  # smaller batch size on CPU ensures fast inference without RAM/thread contention
+CROP_QUEUE_SIZE = 4096
 
 # Each panoid API call already searches a radius around the query point
 # (the "2d50" param in _panoids_url — 50 meters) and returns every pano

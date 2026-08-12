@@ -191,8 +191,11 @@ def extract_megaloc_descriptor(pil_img, apply_pca_reduction=True):
     model = get_megaloc_model()
     tensor = _preprocess_pil(pil_img).unsqueeze(0).to(_device)
     with torch.no_grad():
-        with autocast(_device, dtype=torch.bfloat16):
-            desc = model(tensor)  # [1, 8448]
+        if _device != 'cpu':
+            with autocast(_device, dtype=torch.bfloat16):
+                desc = model(tensor)
+        else:
+            desc = model(tensor)
 
     desc = desc.float().cpu().numpy().squeeze()  # (8448,)
 
@@ -203,16 +206,7 @@ def extract_megaloc_descriptor(pil_img, apply_pca_reduction=True):
 
 
 def batch_extract_megaloc(pil_images, batch_size=16, apply_pca_reduction=False):
-    """Batch extract MegaLoc descriptors from a list of PIL images.
-    
-    Args:
-        pil_images: List of PIL Images
-        batch_size: Batch size for inference
-        apply_pca_reduction: If True and PCA is fitted, reduce dimensions
-        
-    Returns:
-        np.ndarray of shape (N, dim) where dim is PCA_DIM or RAW_DIM
-    """
+    """Batch extract MegaLoc descriptors from a list of PIL images."""
     model = get_megaloc_model()
     all_descs = []
 
@@ -220,8 +214,11 @@ def batch_extract_megaloc(pil_images, batch_size=16, apply_pca_reduction=False):
         batch = pil_images[i:i + batch_size]
         tensors = torch.stack([_preprocess_pil(img) for img in batch]).to(_device)
         with torch.no_grad():
-            with autocast(_device, dtype=torch.bfloat16):
-                descs = model(tensors)  # [B, 8448]
+            if _device != 'cpu':
+                with autocast(_device, dtype=torch.bfloat16):
+                    descs = model(tensors)  # [B, 8448]
+            else:
+                descs = model(tensors)
 
         all_descs.append(descs.float().cpu().numpy())
 
