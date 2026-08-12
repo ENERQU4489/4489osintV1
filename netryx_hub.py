@@ -64,7 +64,9 @@ except ImportError:
 
 HF_ORG = None  # No default org — use tags for discovery!
 BUNDLE_FORMAT_VERSION = "2.0"
-BUNDLE_EXTENSION = ".netryx"
+BUNDLE_EXTENSION = ".4489"
+LEGACY_BUNDLE_EXTENSION = ".noname"
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -347,8 +349,8 @@ Or download manually and use **Import Index** in the Netryx GUI.
 """
 
 
-class NetryxHub:
-    """Client for sharing Netryx indexes via Hugging Face Hub.
+class NoNameHub:
+    """Client for sharing No Name indexes via Hugging Face Hub.
     
     Setup:
         pip install huggingface_hub
@@ -363,15 +365,18 @@ class NetryxHub:
         self.api = HfApi(token=token)
 
     def list_indexes(self):
-        """List all available Netryx indexes on the hub.
+        """List all available No Name & Netryx indexes on the hub.
         
         Returns:
             List of dicts with index metadata
         """
-        print(f"[HUB] Searching globally for Netryx indexes...")
+        print(f"[HUB] Searching globally for No Name indexes...")
         try:
             # 1. Global search (may have indexing delay)
-            datasets_global = list(self.api.list_datasets(search="netryx"))
+            datasets_noname = list(self.api.list_datasets(search="noname"))
+            datasets_netryx = list(self.api.list_datasets(search="netryx"))
+            datasets_global = datasets_noname + datasets_netryx
+
             
             # 2. Direct author search (bypasses indexing lag for YOUR own uploads)
             datasets_mine = []
@@ -798,6 +803,11 @@ def main():
 
     else:
         parser.print_help()
+
+# Alias for backwards compatibility & new branding
+OSINT4489Hub = NoNameHub
+NetryxHub = NoNameHub
+
 
 
 if __name__ == "__main__":

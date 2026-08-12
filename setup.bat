@@ -1,7 +1,7 @@
 @echo off
 echo.
 echo ===================================================
-echo   Netryx Astra V2 - Windows Setup
+echo   4489 OSINT Tool v1 - Windows Setup
 echo ===================================================
 echo.
 
@@ -62,18 +62,6 @@ call venv\Scripts\activate.bat
 echo [OK] Virtual environment activated
 
 :: Force python to install a version of Torch compatible with CUDA
-echo Checking for NVIDIA GPU...
-
-nvidia-smi >nul 2>>installer.log
-if %errorlevel%==0 (
-    echo [OK] NVIDIA GPU detected
-    echo Installing CUDA PyTorch...
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 -q
-) else (
-    echo [INFO] No NVIDIA GPU detected
-    echo Installing CPU PyTorch...
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 -q
-):: Force python to install a version of Torch compatible with CUDA
 echo Checking for NVIDIA GPU...
 
 nvidia-smi >nul 2>>installer.log
@@ -146,10 +134,10 @@ echo.
 echo ===================================================
 echo   Setup complete!
 echo.
-echo   To run Netryx:
+echo   To run 4489 OSINT Tool v1:
 echo     Double-click run.bat
 echo   Or:
 echo     venv\Scripts\activate
-echo     python test_super.py
+echo     python osint4489.py
 echo ===================================================
 pause
