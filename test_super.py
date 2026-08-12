@@ -3680,24 +3680,39 @@ def run_cli():
         img2 = Image.open(args.image2).convert("RGB").resize((256, 256))
         cli_progress_bar(2, 2, prefix="MASt3R", suffix="Obliczanie gęstego dopasowania 3D...")
         m0, m1, conf = get_mast3r_matches(img1, img2, mast3r)
+        print(f"\n[WYNIK] Liczba dopasowanych punktów węzłowych 3D (inlierów): {len(m0)}")
 
     elif args.command == "pull-index":
         import subprocess
+        import shutil
         server = args.server
         print(f"\n{C_CYAN}[POBIERANIE]{C_RESET} 📥 Pobieranie baz danych z serwera {C_BOLD}{server}{C_RESET}...")
         local_dest = INDEXES_DIR
         os.makedirs(local_dest, exist_ok=True)
-        cmd = ["scp", "-r", f"{server}:~/4489osintV1/4489_data/indexes/*", local_dest]
+
+        # Detect OpenSSH binary (e.g. Git for Windows OpenSSH)
+        ssh_bin = "ssh"
+        candidates = [
+            r"C:\Program Files\Git\usr\bin\ssh.exe",
+            r"C:\Windows\System32\OpenSSH\ssh.exe",
+            r"C:\Program Files\OpenSSH-Win64\ssh.exe"
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                ssh_bin = f'"{c}"'
+                break
+
+        # Use tar over SSH pipe (fast, compressed, 100% reliable)
+        cmd = f'{ssh_bin} {server} "tar -czf - -C ~/4489osintV1/4489_data/indexes ." | tar -xzf - -C "{local_dest}"'
         try:
-            res = subprocess.run(cmd)
+            res = subprocess.run(cmd, shell=True)
             if res.returncode == 0:
-                print(f"\n{C_GREEN}[SUKCES]{C_RESET} 🎉 Bazy zostały pomyślnie pobrane z serwera do {local_dest}!")
+                print(f"\n{C_GREEN}[SUKCES]{C_RESET} 🎉 Bazy zostały pomyślnie pobrane i rozpakowane do {local_dest}!")
                 print("Możesz teraz uruchomić GUI (run.bat) do lokalizowania zdjęć!")
             else:
-                print(f"\n{C_RED}[BŁĄD]{C_RESET} Pobieranie SCP zakończyło się z kodem {res.returncode}")
+                print(f"\n{C_RED}[BŁĄD]{C_RESET} Pobieranie SSH/tar zakończyło się z kodem {res.returncode}")
         except Exception as e:
-            print(f"\n{C_RED}[BŁĄD]{C_RESET} Wyjątek SCP: {e}")
-        print(f"\n[WYNIK] Liczba dopasowanych punktów węzłowych 3D (inlierów): {len(m0)}")
+            print(f"\n{C_RED}[BŁĄD]{C_RESET} Wyjątek pobierania: {e}")
 
     elif args.command == "hub":
         if not HUB_AVAILABLE:
