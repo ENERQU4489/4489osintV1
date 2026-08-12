@@ -946,16 +946,16 @@ def build_compact_index():
 
         idx += n
         del data, descs
-        if (i+1) % 100 == 0:
-            print(f"  Loaded {i+1}/{len(part_files)} ({idx} entries) [{time.time()-t0:.0f}s]")
+        # Print progress on every part file for responsive CLI feedback
+        cli_progress_bar(i + 1, len(part_files), prefix="Łączenie Części Bazy", suffix=f"{idx} wpisów")
 
     # Trim if we skipped any files
     if idx < total:
         all_descs = all_descs[:idx]
-        print(f"[INDEX] Trimmed to {idx} entries (skipped some incompatible files)")
+        print(f"[INDEKS] Przycięto do {idx} wpisów (pominięto niekompatybilne pliki)")
         total = idx
 
-    print(f"[INDEX] Loaded all {idx} entries in {time.time()-t0:.1f}s")
+    print(f"[INDEKS] Załadowano wszystkie {idx} wpisy w {time.time()-t0:.1f}s")
 
     # ── Load lat/lon from CSV ──
     print(f"[INDEX] Loading coordinates from {EMB_CSV}...")
@@ -2157,6 +2157,8 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
                 megaloc_buffer_paths.extend([m['path'] for m in meta])
                 megaloc_buffer_lats.extend([m['lat'] for m in meta])
                 megaloc_buffer_lons.extend([m['lon'] for m in meta])
+                total_target = len(panoids) * embeddings_per_panoid
+                update_status(f"Kodowanie cech ({ACTIVE_ENCODER.upper()}): {total_extracted}/{total_target} wycinków", current=total_extracted, total=total_target)
 
                 if len(megaloc_buffer_paths) >= 5000:
                     save_megaloc_chunk()
