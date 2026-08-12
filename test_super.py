@@ -1114,12 +1114,17 @@ def build_compact_index():
         radius_km=radius_km,
     )
 
-    print(f"\n[INDEX] ✅ Saved compact index:")
-    print(f"  ID: {index_id}")
-    print(f"  Descriptors: {COMPACT_DESCS_PATH} ({size_d:.1f} MB)")
-    print(f"  Metadata: {COMPACT_META_PATH} ({size_m:.1f} MB)")
-    print(f"  Descriptor dim: {final_dim} (from raw {raw_dim})")
-    print(f"  Total: {size_d + size_m:.1f} MB")
+    print("\n" + "=" * 65)
+    print(f"{C_BOLD}{C_GREEN}   🎉 BAZA DANYCH 4489 OSINT ZOSTAŁA POMYŚLNIE ZBUDOWANA!{C_RESET}")
+    print("=" * 65)
+    print(f"  {C_CYAN}ID Bazy:{C_RESET}       {C_BOLD}{index_id}{C_RESET}")
+    print(f"  {C_CYAN}Wpisów:{C_RESET}        {C_BOLD}{len(valid_idx):,}{C_RESET} punktów widokowych")
+    print(f"  {C_CYAN}Wymiarowość:{C_RESET}   {final_dim}-dim (z surowych {raw_dim}-dim)")
+    print(f"  {C_CYAN}Rozmiar plików:{C_RESET} {size_d + size_m:.1f} MB (Wektory: {size_d:.1f} MB, Meta: {size_m:.1f} MB)")
+    if center_lat and center_lon:
+        print(f"  {C_CYAN}Środek obszaru:{C_RESET} ({center_lat:.5f}, {center_lon:.5f}) | Promień: {radius_km:.1f} km")
+        print(f"  {C_CYAN}Google Maps:{C_RESET}   https://www.google.com/maps/@{center_lat:.5f},{center_lon:.5f},14z")
+    print("=" * 65 + "\n")
 
     _compact_cache = None  # Force reload
     return True
@@ -2077,24 +2082,25 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
         if status_cb:
             status_cb(msg, current, total)
 
-    update_status("Pobieranie siatki punktów...")
+    update_status(f"{C_CYAN}[PROBE]{C_RESET} 📍 Generowanie siatki punktów...")
     points = grid_points(center, radius, res)
-    update_status(f"Wygenerowano {len(points)} punktów siatki. Skanowanie panoram...")
+    update_status(f"{C_CYAN}[PROBE]{C_RESET} 🌐 Wygenerowano {len(points)} punktów siatki. Skanowanie dostępnych panoram...")
 
     def panoid_status(idx, total):
-        update_status(f"Skan panoram {idx}/{total}", current=idx, total=total)
+        update_status("Skan Panoram", current=idx, total=total)
 
     panoids = get_panoids(
         points,
         status_callback=panoid_status,
         max_workers=MAX_PANOID_WORKERS
     )
-    update_status(f"Wykryto {len(panoids)} panoram. Inicjalizacja modelu {ACTIVE_ENCODER.upper()}...")
+    print(f"\n{C_GREEN}[PANORAMY]{C_RESET} 🎯 Wykryto {C_BOLD}{len(panoids)}{C_RESET} unikalnych panoram w wybranym obszarze.")
+    update_status(f"{C_MAGENTA}[MODEL]{C_RESET} 🧠 Ładowanie enkodera {C_BOLD}{ACTIVE_ENCODER.upper()}{C_RESET}...")
     try:
         dummy_img = Image.new("RGB", (256, 256), (0, 0, 0))
         _ = encode_query(dummy_img)
     except Exception as e:
-        print(f"[ENCODER] Pre-warm warning: {e}")
+        print(f"{C_YELLOW}[MODEL]{C_RESET} Ostrzeżenie inicjalizacji: {e}")
 
     headings_all = sorted(list(set(((h // crop_step) * crop_step) % 360 for h in range(0, 360, crop_step))))
     embeddings_per_panoid = len(headings_all)
@@ -2142,13 +2148,13 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
                     lats=np.array(megaloc_buffer_lats, dtype=np.float32),
                     lons=np.array(megaloc_buffer_lons, dtype=np.float32),
                 )
-                update_status(f"Zapisano pakiet danych: {len(megaloc_buffer_paths)} wycinków")
+                print(f"\n{C_GREEN}[ZAPIS]{C_RESET} 💾 Zapisano pakiet wektorów: {C_BOLD}{len(megaloc_buffer_paths):,}{C_RESET} wycinków kadru -> {part_filename}")
                 megaloc_buffer_descs.clear()
                 megaloc_buffer_paths.clear()
                 megaloc_buffer_lats.clear()
                 megaloc_buffer_lons.clear()
             except Exception as e:
-                print(f"Błąd zapisu pakietu danych: {e}")
+                print(f"{C_RED}[BŁĄD ZAPISU]{C_RESET} {e}")
 
         def process_batch(buffer):
             nonlocal total_extracted
@@ -2163,12 +2169,12 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
                 megaloc_buffer_lats.extend([m['lat'] for m in meta])
                 megaloc_buffer_lons.extend([m['lon'] for m in meta])
                 total_target = len(panoids) * embeddings_per_panoid
-                update_status(f"Kodowanie cech ({ACTIVE_ENCODER.upper()}): {total_extracted}/{total_target} wycinków", current=total_extracted, total=total_target)
+                update_status(f"Wektory {ACTIVE_ENCODER.upper()}", current=total_extracted, total=total_target)
 
                 if len(megaloc_buffer_paths) >= 5000:
                     save_megaloc_chunk()
             except Exception as e:
-                print(f"Błąd przetwarzania pakietu: {e}")
+                print(f"{C_RED}[BŁĄD ENKODERA]{C_RESET} {e}")
 
         while True:
             item = crop_queue.get()
@@ -3392,13 +3398,42 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
         # check queue again soon
 
 
+# ANSI Colors for Rich Interactive CLI Logging
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_GREEN = "\033[1;32m"
+C_CYAN = "\033[1;36m"
+C_YELLOW = "\033[1;33m"
+C_MAGENTA = "\033[1;35m"
+C_BLUE = "\033[1;34m"
+C_RED = "\033[1;31m"
+C_WHITE = "\033[1;97m"
+
 def cli_progress_bar(current, total, prefix="Progress", suffix="", length=30):
-    """Monochrome ASCII progress bar for CLI mode."""
+    """Interactive colorful progress bar with badges and metrics for CLI."""
     total = max(1, total)
-    percent = f"{100 * (current / float(total)):.1f}"
-    filled_length = int(length * current // total)
+    ratio = min(1.0, max(0.0, current / float(total)))
+    percent = f"{100 * ratio:.1f}"
+    filled_length = int(length * ratio)
     bar = "█" * filled_length + "░" * (length - filled_length)
-    sys.stdout.write(f"\r\033[K{prefix} [{bar}] {percent}% ({current}/{total}) {suffix}")
+    
+    # Dynamic color gradient: Cyan -> Yellow -> Green
+    if ratio < 0.35:
+        bar_color = C_CYAN
+    elif ratio < 0.85:
+        bar_color = C_YELLOW
+    else:
+        bar_color = C_GREEN
+
+    prefix_str = f"{C_BOLD}{C_WHITE}{prefix:<20}{C_RESET}"
+    bar_str = f"{bar_color}[{bar}]{C_RESET}"
+    pct_str = f"{C_BOLD}{C_YELLOW}{percent:>5}%{C_RESET}"
+    count_str = f"{C_DIM}({current:,}/{total:,}){C_RESET}"
+    suffix_str = f"{C_CYAN}{suffix}{C_RESET}"
+
+    line = f"\r\033[K{prefix_str} {bar_str} {pct_str} {count_str} {suffix_str}"
+    sys.stdout.write(line)
     sys.stdout.flush()
     if current >= total:
         sys.stdout.write("\n")
