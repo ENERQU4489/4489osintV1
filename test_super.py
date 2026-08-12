@@ -3494,6 +3494,10 @@ def run_cli():
     p_match.add_argument("--image1", required=True, help="Ścieżka do pierwszego obrazu")
     p_match.add_argument("--image2", required=True, help="Ścieżka do drugiego obrazu")
 
+    # Pull Index Command
+    p_pull = subparsers.add_parser("pull-index", help="Pobierz bazy danych z serwera przez SCP")
+    p_pull.add_argument("--server", default="michal@100.95.138.26", help="Adres SSH serwera (domyślnie: michal@100.95.138.26)")
+
     # Hub Command
     p_hub = subparsers.add_parser("hub", help="Operacje w bazie społeczności (Hub)")
     hub_sub = p_hub.add_subparsers(dest="hub_command")
@@ -3676,6 +3680,23 @@ def run_cli():
         img2 = Image.open(args.image2).convert("RGB").resize((256, 256))
         cli_progress_bar(2, 2, prefix="MASt3R", suffix="Obliczanie gęstego dopasowania 3D...")
         m0, m1, conf = get_mast3r_matches(img1, img2, mast3r)
+
+    elif args.command == "pull-index":
+        import subprocess
+        server = args.server
+        print(f"\n{C_CYAN}[POBIERANIE]{C_RESET} 📥 Pobieranie baz danych z serwera {C_BOLD}{server}{C_RESET}...")
+        local_dest = INDEXES_DIR
+        os.makedirs(local_dest, exist_ok=True)
+        cmd = ["scp", "-r", f"{server}:~/4489osintV1/4489_data/indexes/*", local_dest]
+        try:
+            res = subprocess.run(cmd)
+            if res.returncode == 0:
+                print(f"\n{C_GREEN}[SUKCES]{C_RESET} 🎉 Bazy zostały pomyślnie pobrane z serwera do {local_dest}!")
+                print("Możesz teraz uruchomić GUI (run.bat) do lokalizowania zdjęć!")
+            else:
+                print(f"\n{C_RED}[BŁĄD]{C_RESET} Pobieranie SCP zakończyło się z kodem {res.returncode}")
+        except Exception as e:
+            print(f"\n{C_RED}[BŁĄD]{C_RESET} Wyjątek SCP: {e}")
         print(f"\n[WYNIK] Liczba dopasowanych punktów węzłowych 3D (inlierów): {len(m0)}")
 
     elif args.command == "hub":
