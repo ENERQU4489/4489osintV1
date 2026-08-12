@@ -2258,12 +2258,14 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PANOID_WORKERS) as executor:
         for idx, _ in enumerate(executor.map(process_one_panoid, panoids_needing_download), skipped + 1):
             tracker.update(idx)
-            update_status(f"Łączenie & Projekcja 3D: {tracker.get_status()}", current=idx, total=len(panoids))
+            update_status(f"Łączenie & Projekcja 3D", current=idx, total=len(panoids))
 
+    print(f"\n{C_MAGENTA}[WEKTORY]{C_RESET} ⚡ Projekcja 3D zakończona! Przeprowadzanie dedukcji neuronowej {ACTIVE_ENCODER.upper()}...")
     crop_queue.put("DONE")
     extractor_thread.join()
 
-    update_status(f"Zapisano wektory ({total_extracted} nowych). Budowanie skompresowanej bazy...")
+    print(f"\n{C_GREEN}[WEKTORY]{C_RESET} ✅ Wektorowanie cech zakończone ({total_extracted:,} wycinków). Budowanie skompresowanej bazy...")
+    update_status(f"Budowanie skompresowanej bazy...")
 
     success = build_compact_index()
     update_status(f"Gotowe! Baza danych została zbudowana ({total_extracted} nowych wpisów).")
