@@ -2120,7 +2120,7 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
     except Exception as e:
         update_status(f"Ostrzeżenie: Nie można załadować pamięci podręcznej: {e}")
 
-    crop_queue = queue.Queue(maxsize=CROP_QUEUE_SIZE)
+    crop_queue = queue.Queue()
     tracker = ProgressTracker(len(panoids), estimate_storage=True,
                              embeddings_per_item=embeddings_per_panoid, avg_bytes_per_embedding=2560)
     total_extracted = 0
