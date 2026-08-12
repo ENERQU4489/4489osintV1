@@ -2089,7 +2089,12 @@ def process_index_creation(center, radius, res, crop_fov=90, crop_size=256, crop
         status_callback=panoid_status,
         max_workers=MAX_PANOID_WORKERS
     )
-    update_status(f"Wykryto {len(panoids)} panoram. Ekstrakcja cech ({ACTIVE_ENCODER.upper()})...")
+    update_status(f"Wykryto {len(panoids)} panoram. Inicjalizacja modelu {ACTIVE_ENCODER.upper()}...")
+    try:
+        dummy_img = Image.new("RGB", (256, 256), (0, 0, 0))
+        _ = encode_query(dummy_img)
+    except Exception as e:
+        print(f"[ENCODER] Pre-warm warning: {e}")
 
     headings_all = sorted(list(set(((h // crop_step) * crop_step) % 360 for h in range(0, 360, crop_step))))
     embeddings_per_panoid = len(headings_all)
@@ -3393,7 +3398,7 @@ def cli_progress_bar(current, total, prefix="Progress", suffix="", length=30):
     percent = f"{100 * (current / float(total)):.1f}"
     filled_length = int(length * current // total)
     bar = "█" * filled_length + "░" * (length - filled_length)
-    sys.stdout.write(f"\r{prefix} [{bar}] {percent}% ({current}/{total}) {suffix}")
+    sys.stdout.write(f"\r\033[K{prefix} [{bar}] {percent}% ({current}/{total}) {suffix}")
     sys.stdout.flush()
     if current >= total:
         sys.stdout.write("\n")
